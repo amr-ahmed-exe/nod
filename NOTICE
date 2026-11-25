@@ -1,0 +1,29 @@
+Nod
+Copyright 2026 n8n GmbH
+
+This product includes software developed at n8n GmbH (https://n8n.io/).
+
+The local phoneme processor includes Spellophone and eSpeak NG under
+GPL-3.0-or-later. Its source file src/providers/local-speech/phonemizer-worker.ts
+is distributed under GPL-3.0-or-later. See desktop/licenses/speech.md for component
+attribution and corresponding source. Desktop builds include the license and
+verified source archives under engine/licenses/speech.
+
+Agent Plugins 1.0.0 JSON Schemas
+Source: https://github.com/agentplugins/agent-plugins-spec
+Schemas in src/server/agent-plugins/ are distributed under Apache-2.0.
+
+================================================================================
+Additional Credits and Fork Attributions (amr-ahmed-exe/nod)
+
+- Original Project: n8n-io/nod (https://github.com/n8n-io/nod)
+  Apache License 2.0 — core architecture, web interface, bundled apps,
+  container sandboxing design, and documentation.
+
+- Community Fork Inspiration: mohamed0s/nod
+  Pages (Artifacts) and Jobs workflow concepts integrated into Nod-RS.
+
+- Rust Runtime & Fork Maintenance: amr-ahmed-exe/nod
+  Native Rust desktop/headless server runtime (nod-rs), Alpine Linux guest
+  container optimizations, System Tray background execution, automatic
+  SHA-256 verified GitHub Releases updater, Multi-Bot isolation, and themes.

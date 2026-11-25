@@ -1,0 +1,30 @@
+FROM alpine:3.21 AS rtk
+RUN apk add --no-cache curl tar ca-certificates
+COPY src/providers/docker/install-rtk.sh /tmp/install-rtk.sh
+RUN if [ "$(uname -m)" = "x86_64" ]; then sh /tmp/install-rtk.sh prebuilt; else apk add --no-cache cargo rust && sh /tmp/install-rtk.sh; fi
+
+FROM alpine:3.21
+ARG NOD_RUNTIME_REFRESH
+RUN apk add --no-cache \
+    nodejs npm iptables ip6tables python3 py3-pip py3-requests py3-beautifulsoup4 \
+    ffmpeg poppler-utils jq tesseract-ocr ca-certificates curl git unzip ripgrep \
+    libreoffice qpdf ghostscript zip xz file sqlite font-noto \
+    && mkdir -p /usr/bin \
+    && ln -sf /bin/sleep /usr/bin/sleep
+RUN apk add --no-cache yt-dlp
+COPY --chmod=555 src/providers/docker/save-video.py /usr/local/bin/save-video
+COPY --from=rtk --chmod=555 /opt/rtk/bin/rtk /usr/local/bin/rtk
+COPY --from=rtk /opt/rtk/LICENSE /usr/share/doc/rtk/LICENSE
+RUN addgroup -g 1000 node && adduser -u 1000 -G node -s /bin/sh -D node \
+    && mkdir -p /workspace /home/node/.local/bin \
+    && chown -R node:node /workspace /home/node \
+    && addgroup -g 1002 nod-connected \
+    && adduser -u 1002 -G nod-connected -s /sbin/nologin -D nod-connected \
+    && mkdir -p /home/nod-connected \
+    && chmod 700 /home/nod-connected
+COPY --chmod=555 src/providers/docker/workspace-network.sh /usr/local/bin/nod-workspace-network
+USER node
+ENV LANG=C.UTF-8
+ENV NPM_CONFIG_PREFIX=/home/node/.local
+ENV PATH=/home/node/.local/bin:$PATH
+WORKDIR /workspace

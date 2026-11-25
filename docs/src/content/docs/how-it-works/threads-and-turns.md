@@ -1,0 +1,208 @@
+---
+title: Threads and turns
+description: How messages, saved tasks, schedules and events run as turns in parallel sessions.
+sidebar:
+  order: 2
+---
+
+This page explains how Nod turns your messages, schedules and events into work, and how that work shares one conversation.
+
+The short version: you have one thread. Every piece of work on it runs in a session: the chat has one, each saved task has one, and each schedule fire has one. App events and source checks share one observer session. A session runs one turn at a time, sessions run in parallel, and they all share one workspace. Turns and tool calls aren't retried automatically.
+
+## One thread per owner
+
+Each owner has one active row in the `threads` table, shared by web, Telegram and WhatsApp. The thread ID keys the sandbox workspace and the chat session: its persistent Pi session (the transcript) and its browser.
+
+The code lives in [`src/server/thread.ts`](https://github.com/n8n-io/nod/blob/main/src/server/thread.ts).
+
+## Every piece of work is a turn
+
+A turn is one run of the agent. Each turn is a row in the `turns` table with a `source` and a `session_id`, and it records its reply channel, so a Telegram message gets its answer on Telegram.
+
+| `source`   | Created by                                                                                                             | Session                                      |
+| ---------- | ---------------------------------------------------------------------------------------------------------------------- | -------------------------------------------- |
+| `user`     | A message from you, or a reaction that starts ordinary chat work                                                       | The chat, or the session selected by a reply |
+| `task`     | Chat dispatch or an addressed owner update                                                                             | The saved task session                       |
+| `schedule` | A schedule firing                                                                                                      | A new session                                |
+| `event`    | A source batch or observer task                                                                                        | The observer or the task                     |
+| `resume`   | A completed secure form, payment approval, app connection, or your reply or reaction confirming or declining an action | The session that asked                       |
+
+A recurring schedule skips a firing while an earlier run is queued, running or still needs your answer. An earlier waiting turn no longer holds a firing after a later turn starts in that run's session. A schedule run can't create schedules.
+
+Creating a turn also queues a `thread-drain` job in the same transaction. Unless the turn waits for a start time, such as a task held until quiet hours end, the worker is woken as soon as that transaction commits instead of waiting for its next poll.
+
+## How the worker starts turns
+
+```mermaid
+flowchart TD
+  new[New turn row<br/>and drain job] --> worker[Worker takes<br/>up to 20 jobs]
+  worker --> lock[Lock the thread once]
+  lock --> each{{For each session:<br/>a turn running?}}
+  each -- no --> next[Start its oldest<br/>queued turn]:::go
+  each -- yes --> wait[Leave it queued]:::muted
+```
+
+The worker fetches up to 20 drain jobs at once and drains each thread in the batch once, so extra drain jobs don't delay later turns. It starts turns from independent sessions without waiting for them. When a turn finishes, it queues the next drain.
+
+## Turn status
+
+```mermaid
+stateDiagram-v2
+  direction LR
+  [*] --> queued
+  queued --> running
+  running --> succeeded
+  running --> waiting
+  running --> failed
+  queued --> cancelled
+  running --> cancelled
+  waiting --> cancelled
+  succeeded --> [*]
+  waiting --> [*]
+  failed --> [*]
+  cancelled --> [*]
+```
+
+`withTurnLock(turnId, op)` fences every database write a turn makes. The write runs only if the turn is still `running` on the active thread. A stopped, finished or reset turn can't write anything late, but an outside action that already started can still finish.
+
+Each Stop uses a separate, short-lived database connection, then closes it after the request. Control requests for the same worker pool run one at a time, so concurrent requests do not open more connections. Stop checks the owner and requested scope before it aborts running work. It aborts that work before saving cancellation, so a pending file read cannot hold the turn's database lock. A read that returns later cannot publish a file or message. If saving Stop fails, the aborted turn still records its own cancellation. Stop does not retry the read or any outside action.
+
+Account, schedule and source checks inside a transaction use its database connection. They do not wait for a second connection while they hold the first. Approval and source checks keep their normal locks and owner scope.
+
+## One background observer
+
+App events and source checks update one saved source queue. One observer reads the due batch, prepares useful work, and saves qualified nudges. A new batch keeps its Pi context only while the model's cache is warm and the context is no larger than compaction would keep; the transcript stays saved. When it starts fresh and the previous check was within the hour, its instructions, stable request data and recent chat are read from Anthropic's one-hour cache when an earlier fresh start stored them. A turn runs alone in that session. New signals received during work wait for its next turn. Scheduled runs have separate Pi sessions and choose cache retention from their planned interval; see [scheduled turn caching](/how-it-works/agent-runtime/#scheduled-turn-caching).
+
+```mermaid
+flowchart TD
+  events[App events and source checks] --> inbox[Saved source queue]
+  inbox --> observer[One observer]
+  observer --> saved[Prepared work and nudge receipt]
+  observer --> task[Separate action or question task]
+```
+
+A task that needs an action, question, or approval uses its own session. It keeps the event's authority and the normal Trust check. Its wait leaves the observer free. If the observer starts it during quiet hours, its first turn stays queued until they end. A spending check-in pauses the observer until you answer; source signals remain saved. Explicit schedules keep their own timing and instructions.
+
+## Messages you send while Nod works
+
+The composer never blocks. After each Pi step, a running chat turn takes the oldest queued messages from its own channel and session and steers them into Pi, all at once, before the next model request. Their attachments are copied into the workspace. Images reach the model with the message when the model reads images and they fit the [image limits](/how-it-works/agent-runtime/); others stay workspace files marked as not shown. A reply carries the message it answers. Those messages move to the running turn, and their own turns close. The next line Nod writes after taking them is posted as a message, so an answer to them never shows only as live status.
+
+A message from another channel stops the take. It and every message after it stay queued and run as their own turns. Task turns also take addressed updates from their own channel and session. Event and schedule turns do not take queued messages. Each task update has a revision. The server records the revision when it delivers the input at a model boundary. A queued revision does not mean the model has applied it. Task completion refuses an unread update.
+
+## Waiting and resuming
+
+A question, an approval, or a credential request ends the turn as `waiting`. The message that asks, with any link to a secure form, payment, app connection or browser handoff, is saved in the same transaction that marks the turn `waiting`, so you never see a link before its step is open. A reply to any task message continues its saved session. This includes a question, a file or a completed result. A reply to another waiting question continues the session that asked. Unrelated messages continue the chat. A reply to a background question returns to that background session.
+
+Some steps finish outside the Pi session: a completed secure form, a payment approval, a new app connection or your yes or no to a confirmation. Each of these queues a `resume` turn in the session that asked, so a background task's confirmation continues that task. A confirmed action runs once, in that resume turn. If Stop or a failure ends the resume turn before it finishes, each later turn of the session is told whether the approved action ran, may have run or did not run, until a turn of that session succeeds or waits for you. A resume turn records the turn it continues, so the trust check and approvals trace it back to the work that started it. A completed secure form or payment code queues its resume turn in the same transaction that records the entry.
+
+A resume can leave the earlier turn with its `waiting` outcome. It no longer blocks a planned task check after a later turn starts in the same session. Queued turns and running turns block the check. So do questions, approvals and credential requests that still need an answer. Task checks, recurring schedules and secure forms use the same rule to identify a current waiting turn.
+
+A planned task check takes the thread lock before it reads the task and its session. It clears the planned time and queues the resume in one transaction. A Stop or owner update that completes first is read before the check starts. If the transaction fails, the planned time stays saved. The resume continues the last turn that started in the session; a later message absorbed by that turn does not replace it.
+
+A secure form closes when a newer turn starts in its session, and a payment request when you send a newer message there. A chat message is in the chat session, so it never closes a background task's form or payment.
+
+The next turn checks server status for sign-in forms referenced by its recent chat history in the same session. An old link in chat history does not establish that its form is still open.
+
+## Sessions
+
+| Session                                | Key                                                             | Reports to the conversation                                                                                                                                                                                                                       |
+| -------------------------------------- | --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Main chat                              | The thread ID.                                                  | Streams its opening line, shows the text it writes between tool calls as live status, then posts its final reply. That text is posted only when a turn ends without a reply. See [Message cadence](/how-it-works/agent-runtime/#message-cadence). |
+| Task started from chat                 | The task ID, stored in `tasks.session_id`.                      | Sends questions, files and its final reply to the task's message.                                                                                                                                                                                 |
+| Background observer                    | A saved session ID on the active thread.                        | Saves qualified nudges and starts separate tasks for outside actions or waits.                                                                                                                                                                    |
+| Schedule or event outside the observer | Its first turn. A task record created there keeps that session. | Uses explicit delivery tools; a linked task also delivers its final reply.                                                                                                                                                                        |
+
+Every session saves its Pi history and opens its own browser on first use. Each runs one turn at a time; different sessions run in parallel.
+
+When a background turn starts, it loads its own messages and recent conversation messages available before that turn, with other sessions' work included only after it finished. The saved Pi history remains separate. A new main chat turn receives reports sent by other sessions. All sessions share the workspace, so files one writes are available for the others to read.
+
+## Saved tasks
+
+The main chat uses `task start` for work with an independent goal. One transaction saves the task, posts its first message and queues its first turn. Short requests stay in the main chat. A successful turn alone does not close the task; the task checks its completion condition and calls `task finish`.
+
+Explicit replies select a task before the coordinator runs. The coordinator uses `task reply` to forward the exact owner message when an ordinary follow-up selects an existing open task. Once more than one owner message has reached a chat turn, `task start` and `task reply` must name the message they serve, and the server accepts only a message that turn received. The task's first turn starts from that message, and the trust check reads it as the task's owner words. Only a turn started by an owner message in the main chat can forward a message, stop a task or stop all background work. Owner updates keep their source message and revision. Questions, approvals and secure forms use the same wait and resume path as other sessions.
+
+See [Task sessions](/how-it-works/task-sessions/) for the ledger, shared context, channel reply links and task controls.
+
+## Subagents
+
+`delegate {title, instruction}` runs one part of a turn as a subagent: another in-memory Pi session with Nod's tools, its own browser and the shared workspace. The model calls it several times in one step, Pi runs those calls in parallel, and each subagent's final answer comes back as an untrusted tool result. The parent then uses the answers, such as to compare three shops. Helpers do not create saved tasks or control the task ledger.
+
+- **Inside the turn.** Subagents run in the turn that started them, with its authority, trace and spending. **Stop** stops them with it.
+- **Needs you.** A subagent returns questions and browser blockers to the parent. An app confirmation still pauses the whole turn.
+- **Tools.** A subagent cannot delegate, ask or send chat messages to the owner, connect apps, sign in, pay, or open saved browser sessions. A paused turn cannot start another subagent.
+- **Browsers.** A subagent's browser is deleted when it finishes.
+- **Files.** Each subagent starts in `.nod/runs/<run ID>` inside the shared workspace. It returns complete file paths to its parent.
+- **Outcomes.** Model failures and incomplete responses return as errors. They do not count as successful empty answers.
+
+## Every session has its own browser
+
+A session opens its browser on its first browser call, so a session that never browses never starts one. Sessions never share a browser.
+
+- A chat or background session can hand its browser to you. The handoff identifies the exact turn and browser. It closes when that session continues. The developer browser page shows the chat browser.
+- A background session's browser is deleted when the session ends without waiting, or when **Stop** or reset cancels it. If you later continue that task, it starts a fresh, signed-out browser. A reset conversation's browser never comes back.
+- The browser container keeps four browsers live at once. At that limit, a new browser replaces the least recently used one that has been idle for five minutes. A browser waiting for you is never replaced during its 30-minute hold. The replaced browser closes and keeps its profile until it's used again.
+- A browser used in the last five minutes is never closed for another. One idle for longer can be, even while its session or subagent is still running, for example during a long model step. Browsers don't close just because they're idle.
+- When no browser can close yet, a new one waits for a free slot until its session stops. **Stop** cancels the wait at once.
+
+## Stop and failures
+
+The main **Stop** control aborts running turns, cancels queued and waiting turns in every session, and closes all open task records. Stop, and `/stop` without a reply in Telegram or WhatsApp, also catch messages Nod is still handling. Such a message starts no work, even when Nod was still reading it, for example to check whether it answers a confirmation. It's saved with its turn already cancelled and answers no confirmation, question or task. A chat-app message counts from when Nod starts reading it, so one still queued behind another counts as sent after Stop. The Stop control cancels a recording that is still being transcribed before it's saved, and the recording stays ready to send again. A workspace command also ends the processes it detached, when the command itself ends, so work it left behind never outlives it. Stop ends that tree the same way, and escalates to `SIGKILL` for a process that ignores the first signal. A task's **Stop** control affects only that session and its helpers. When the owner asks in chat, `task stop` without an ID does what the main control does for every session except the main chat, so the chat turn can report what it stopped. Stop ends a turn at once, even when a tool call is stuck: Nod stops waiting for it, and nothing it returns later reaches the turn. Stop can't undo an external action that already started. Ordinary turns have no time limit, but every browser command does (see [Sandbox and browser](/how-it-works/sandbox-and-browser/)).
+
+An aborted database transaction stops waiting for a free connection at once. If the pool supplies a connection later, Nod closes it without running the transaction.
+
+Turns and tool calls are never retried. Pi retries a model request that fails with a temporary provider error up to three times with backoff, and leaves the failed attempt out of the model context. With [backup models](/connect/models/#backup-models), Pi retries a temporary error once, and a request that fails before the model answers then continues on the next backup. A refusal doesn't move. A request to a hosted provider that gets no response within 90 seconds counts as a temporary error. Any other error, or a restart during execution, ends the turn `failed`. When an agent model request fails, the error identifies the model and provider and keeps the provider's specific reason, HTTP status and error codes when supplied. This includes any retry delay or limit source the provider reports. Nod does not replace a quota or rate limit with a generic billing warning. It removes secrets and limits the displayed error to 2,000 characters. Structured errors show their messages and error metadata without unrelated response fields. Diagnostic logs retain the provider error with known secrets removed. For work you started (a chat turn, a task, a reply to a task, or work that continues after you answer or approve), Nod posts the error in the main chat or as a reply to the task's message, and a restart posts an interruption notice instead. A model failure is posted as the plain error, because the model that failed can't write it, and names another connection you can switch to when one is set up. When a request to a hosted provider found no network (`ENOTFOUND`, `EAI_AGAIN`, `ENETUNREACH`, `EHOSTUNREACH` or `ENETDOWN`), the error names the provider and says Nod couldn't reach it because the computer had no internet connection, with that code. The provider's raw error stays in the diagnostic logs. The error and the notice above the chat box leave out the switch and the **Settings → Models** link, unless the notice is still showing an earlier model problem; the notice still offers **Try again**. An OpenAI-compatible, Azure OpenAI or Amazon Bedrock connection keeps the usual error and link, because its address or Region may be wrong or its server stopped. A provider whose adapter reports no transport cause, such as Google's, also keeps them. In the desktop app's local assistant, a schedule run or a task Nod started that fails this way also says that scheduled tasks need the computer awake and online, and links to [running Nod on a server](/deploy/self-host/). A schedule run's own model failure also carries a run track that the server writes from the run's record: due and start times, skipped runs, the cause and code, the next run and the schedule revision the run started with, which **Run now** sends. See [Schedules](/use/schedules/#keep-nod-running). Other errors are written by the model, or posted as the plain error when the model can't write them. When the disk is full (`ENOSPC` or `EDQUOT`), the error says the computer is out of disk space and asks you to free up space. When a connection to this computer's own address (`127.0.0.1` or `::1`) fails, the error says Nod lost the connection to a service it runs on the computer and asks you to restart Nod. Both keep the original error. A failed schedule run, or a task Nod started, posts the error naming that work; an event turn posts nothing. Errors also show in **Usage**, and a schedule's in its run history. The session's next turn receives the error as `previousFailure`, so Nod can work around it or tell you what to fix. When a turn's model request fails, a provider refusal included, Nod removes what that request added since the last answered one, such as your message or a tool result, from the session's model context, so the session doesn't send it again. A tool call whose result was removed is marked with an unknown outcome, so Nod checks before it runs that call again. Your message stays in the chat, and the saved transcript keeps everything removed. A restart keeps saved task sessions and waiting questions.
+
+When a turn that carries your message fails at the model provider, that turn is _withdrawn_. When you cancel work with **Stop**, `/stop`, a task's **Stop** or reset, the whole request is withdrawn: the stopped turn and the earlier turns it continues in that session, such as the turn that asked you a question or for a sign-in. A waiting turn that a later turn had already replaced isn't. Work that carries none of your words, such as an app check, has nothing to withdraw. When Nod stops tasks for you with `task stop`, or cancels a turn for another reason, nothing is withdrawn.
+
+Your messages from a withdrawn turn stay in the chat, and Nod can still find them with `history_search`. Nothing else gives them to a model:
+
+- A session that starts fresh doesn't get them as recent chat, and related-message and memory recall leave them out. Nod's own replies from that turn stay, so later work knows what happened.
+- The trust check doesn't count them as your words, and a later short reply never accepts something Nod proposed in that turn.
+- Approval questions do not use them, and memory learning skips them unless Nod names one when you ask it to remember something.
+- A planned task check or another resume does not copy a withdrawn turn's request into its prompt.
+
+The session's next turn is told how its previous request ended, so Nod doesn't pick it up again on its own. What that turn already did stays in the session's context. To continue, ask again. Nod finds the request with `history_search`, and the trust check asks before any action your new words don't cover.
+
+When the monthly spending limit is reached, schedule, event, task and resume turns end `failed` before they call the model. Work you started posts one limit notice that names the limit and links to **Usage**. A `user` turn, started by a message you send in chat or as a reply to a task, still runs, so you can change the limit from any channel. Its model calls and trust checks pass the limit, and its tools refuse everything except replies, `usage_get` and `limits_update`. Transcribing your own voice message also passes the limit.
+
+Each session also checks in with you. When its model spend since your last message to it passes the task check-in ($5 by default, changed by asking Nod in chat), its tools refuse new work and the model asks you whether to keep going with `ask_user`. The model writes a `{spent}` placeholder where the question states the cost, and Nod puts in the spend since your last message to that session at the moment it asks, so the amount includes the steps taken after the check-in was reached. When part of it is ChatGPT plan usage, a `{plan}` placeholder gets that part. Reporting tools still work, and so do the task actions that report, update, finish, list or stop saved work; `task start` and `task reply` do not, in any session. Helpers stop at their next step. A model that keeps trying to work for two more steps ends the turn `failed` with a check-in notice. An observer turn that ends past the check-in without asking waits on that notice as its question instead, so no new batch starts until you reply. Your next message to that session starts a new count.
+
+## Reset
+
+### Start fresh chat
+
+The owner can send `/clear` through web, desktop, Telegram or WhatsApp. The server handles it without a model call.
+
+Under the thread lock, it cancels only main-chat turns, saves the command, and records new context and view boundaries. This context change does not withdraw owner requests. Saved task and schedule instructions stay valid; a request already withdrawn by Stop or a model failure stays withdrawn. The next main-chat turn starts a fresh Pi transcript. Recent chat and automatic related-chat recall exclude earlier messages. Chat search can still read them.
+
+The intake boundary changes only after commit. Main-chat input still in progress, including transcription, is cancelled before it can save a new message or file. Web requests carry the last view boundary, so a queued main-chat message is refused after another client clears the chat. Addressed task replies keep their task session.
+
+The thread, workspace, browser, independent tasks, schedules, memory, accounts and settings stay. A repeated web command with the same message ID returns its first result and does not clear newer work. A stale thread ID or a message ID from another request is refused. The chat apps use their saved inbox transaction to handle the command once.
+
+### Restart chat context
+
+When a chat turn ends with a confirmed context failure, the web and desktop apps offer **Restart chat**. Automatic retries and compaction finish before this control appears. Other model errors do not offer a context restart.
+
+`POST /api/conversation/restart-context` requires the active thread ID and its latest failed chat turn ID. It refuses a stale request or a chat with queued or running work. An earlier question that a later turn replaced does not block it. It records a restart boundary without a model call. The next chat turn opens a fresh Pi transcript and receives only recent chat after that boundary. Earlier transcripts and messages remain saved. Chat history search can still read earlier messages.
+
+The thread, workspace, browser, independent tasks, schedules, memory, accounts and settings stay. The failed request and its actions do not run again. The owner sends a new request to continue.
+
+### Start a new conversation
+
+Reset is available through the development API at `POST /api/conversation/reset`. It archives the thread, cancels its turns and closes its open task records. The next turn starts a new Pi session, workspace and browser.
+
+| Archived                                             | Deleted                                                    | Kept                                                          |
+| ---------------------------------------------------- | ---------------------------------------------------------- | ------------------------------------------------------------- |
+| The thread with its messages, turns and task history | The old browser's throwaway profile, downloads and screens | Accounts, Vault, schedules, saved browser sessions and memory |
+
+The web client sends its `threadId` with each message, so a late message from before the reset is refused. A chat-app message Nod was still reading is saved in the new thread with its turn already cancelled.
+
+## Related resources
+
+- [Architecture](/how-it-works/architecture/)
+- [Task sessions](/how-it-works/task-sessions/)
+- [The agent runtime](/how-it-works/agent-runtime/)
+- [Sandbox and browser isolation](/how-it-works/sandbox-and-browser/)
+- [One use, one result](/trust/outcomes/)
+- [Chat with Nod](/use/chat/)

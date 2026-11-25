@@ -1,0 +1,328 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+      - 'nod-v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag name (e.g. v0.1.0)'
+        required: true
+        default: 'v0.1.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-ui:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build web & setup UI
+        run: pnpm run build
+
+      - name: Stage nod-rs web assets
+        run: |
+          mkdir -p nod-rs-web
+          cp -a dist/web/. nod-rs-web/
+          cp dist/desktop-ui/index.html nod-rs-web/setup.html
+          cp dist/desktop-ui/setup.css nod-rs-web/setup.css
+          cp dist/desktop-ui/setup.js nod-rs-web/setup.js
+          cp dist/desktop-ui/styles.css nod-rs-web/styles.css
+          cp dist/desktop-ui/Geist-Variable.woff2 nod-rs-web/Geist-Variable.woff2
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nod-web-assets
+          path: nod-rs-web
+          retention-days: 1
+
+  build-windows:
+    needs: build-ui
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: nod-web-assets
+          path: nod-rs/web
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nod-rs
+
+      - name: Verify & build Windows release binary
+        shell: bash
+        run: |
+          cargo clippy --manifest-path nod-rs/Cargo.toml --all-targets -- -D clippy::all -D warnings
+          cargo test --manifest-path nod-rs/Cargo.toml
+          cargo build --manifest-path nod-rs/Cargo.toml --release
+          mkdir -p out/pkg
+          cp nod-rs/target/release/nod.exe out/nod-windows-x86_64.exe
+          cp nod-rs/target/release/nod.exe out/pkg/nod.exe
+          cp README.md LICENSE NOTICE out/pkg/
+          (cd out/pkg && 7z a -tzip ../nod-windows-x86_64.zip nod.exe README.md LICENSE NOTICE)
+          rm -rf out/pkg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: out/
+          retention-days: 1
+
+  build-linux:
+    needs: build-ui
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: nod-web-assets
+          path: nod-rs/web
+
+      - name: Install Linux desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nod-rs
+
+      - name: Build desktop & headless Linux release binaries
+        run: |
+          cargo test --manifest-path nod-rs/Cargo.toml
+          cargo build --manifest-path nod-rs/Cargo.toml --release
+          mkdir -p out/desktop-pkg out/headless-pkg
+          cp nod-rs/target/release/nod out/nod-linux-x86_64
+          cp nod-rs/target/release/nod out/desktop-pkg/nod
+          cp README.md LICENSE NOTICE out/desktop-pkg/
+          tar -czf out/nod-linux-x86_64.tar.gz -C out/desktop-pkg nod README.md LICENSE NOTICE
+
+          cargo build --manifest-path nod-rs/Cargo.toml --release --no-default-features
+          cp nod-rs/target/release/nod out/nod-linux-x86_64-headless
+          cp nod-rs/target/release/nod out/headless-pkg/nod
+          cp README.md LICENSE NOTICE out/headless-pkg/
+          tar -czf out/nod-linux-x86_64-headless.tar.gz -C out/headless-pkg nod README.md LICENSE NOTICE
+          rm -rf out/desktop-pkg out/headless-pkg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: out/
+          retention-days: 1
+
+  build-windows-guest:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install zstd
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends zstd
+
+      - name: Build workload container images
+        run: |
+          docker pull --platform linux/amd64 postgres:17-alpine
+          docker build --platform linux/amd64 -f Dockerfile.workspace -t nod-workspace:local .
+          docker build --platform linux/amd64 -f Dockerfile.browser -t nod-browser:local .
+
+      - name: Export images & build Alpine WSL2 guest runtime
+        run: |
+          node --input-type=module << 'EOF'
+          import { execFileSync, spawn } from 'node:child_process';
+          import { createHash } from 'node:crypto';
+          import { createReadStream, createWriteStream } from 'node:fs';
+          import { copyFile, mkdir, rename, rm, stat, writeFile } from 'node:fs/promises';
+          import { dirname, join } from 'node:path';
+          import { Readable } from 'node:stream';
+          import { pipeline } from 'node:stream/promises';
+          import { createGzip } from 'node:zlib';
+
+          async function sha256File(path) {
+            const h = createHash('sha256');
+            await pipeline(createReadStream(path), h);
+            return h.digest('hex');
+          }
+
+          async function downloadVerified(url, expectedSha, dst) {
+            const res = await fetch(url);
+            if (!res.ok) throw new Error(`Failed to fetch ${url}: ${res.status}`);
+            await pipeline(Readable.fromWeb(res.body), createWriteStream(`${dst}.tmp`));
+            const actual = await sha256File(`${dst}.tmp`);
+            if (actual !== expectedSha) throw new Error(`Checksum mismatch for ${url}`);
+            await rename(`${dst}.tmp`, dst);
+          }
+
+          const outDir = 'runtime-out';
+          const ctxDir = 'runtime-ctx';
+          await mkdir(join(ctxDir, 'images'), { recursive: true });
+          await mkdir(outDir, { recursive: true });
+
+          const specs = [
+            { name: 'postgres', ref: 'postgres:17-alpine' },
+            { name: 'workspace', ref: 'nod-workspace:local' },
+            { name: 'browser', ref: 'nod-browser:local' },
+          ];
+
+          const images = [];
+          for (const spec of specs) {
+            const id = execFileSync('docker', ['image', 'inspect', '--format', '{{.Id}}', spec.ref], { encoding: 'utf8' }).trim();
+            const size = Number(execFileSync('docker', ['image', 'inspect', '--format', '{{.Size}}', spec.ref], { encoding: 'utf8' }).trim());
+            const tarPath = join(ctxDir, 'images', `${spec.name}.tar`);
+            const zstPath = join(ctxDir, 'images', `${spec.name}.tar.zst`);
+            execFileSync('docker', ['save', '-o', tarPath, spec.ref], { stdio: 'inherit' });
+            execFileSync('zstd', ['-T0', '-6', '--rm', tarPath, '-o', zstPath], { stdio: 'inherit' });
+            images.push({
+              name: spec.name,
+              reference: spec.ref,
+              id,
+              file: `images/${spec.name}.tar.zst`,
+              bytes: (await stat(zstPath)).size,
+              size,
+              sha256: await sha256File(zstPath),
+            });
+          }
+
+          const manifest = { version: 1, platform: 'win32-x64', images };
+          await writeFile(join(ctxDir, 'manifest.json'), JSON.stringify(manifest));
+          await copyFile('desktop/runtime/Dockerfile.windows', join(ctxDir, 'Dockerfile'));
+          await copyFile('desktop/runtime/windows-guest.py', join(ctxDir, 'windows-guest.py'));
+
+          await downloadVerified(
+            'https://download.docker.com/linux/static/stable/x86_64/docker-28.5.1.tgz',
+            '5c0d19f31fece1accd0358bb8cff591fe25d7b6cba19f0fd412cbfdc07f75ff6',
+            join(ctxDir, 'docker.tgz'),
+          );
+
+          const notices = [
+            { file: 'licenses/docker-cli/LICENSE', url: 'https://raw.githubusercontent.com/docker/cli/e180ab8ab82d22b7895a3e6e110cf6dd5c45f1d7/LICENSE', sha256: '2d81ea060825006fc8f3fe28aa5dc0ffeb80faf325b612c955229157b8c10dc0' },
+            { file: 'licenses/docker-cli/NOTICE', url: 'https://raw.githubusercontent.com/docker/cli/e180ab8ab82d22b7895a3e6e110cf6dd5c45f1d7/NOTICE', sha256: 'a8c869fbda819afb8d80e0ac19bac52e766bc6c19cb38cf94f52d64c4be2aab6' },
+            { file: 'licenses/docker-engine/LICENSE', url: 'https://raw.githubusercontent.com/moby/moby/f8215cc266744ef195a50a70d427c345da2acdbb/LICENSE', sha256: '7c87873291f289713ac5df48b1f2010eb6963752bbd6b530416ab99fc37914a8' },
+            { file: 'licenses/docker-engine/NOTICE', url: 'https://raw.githubusercontent.com/moby/moby/f8215cc266744ef195a50a70d427c345da2acdbb/NOTICE', sha256: 'b40ec5b16182103ef1cd69d42a21c98369e35bd483b3973902da4807c0755446' },
+          ];
+          for (const n of notices) {
+            await mkdir(dirname(join(ctxDir, n.file)), { recursive: true });
+            await downloadVerified(n.url, n.sha256, join(ctxDir, n.file));
+          }
+
+          execFileSync('docker', ['build', '--platform', 'linux/amd64', '-t', 'nod-windows-rootfs:local', ctxDir], { stdio: 'inherit' });
+          const cid = execFileSync('docker', ['create', '--platform', 'linux/amd64', 'nod-windows-rootfs:local', '/bin/true'], { encoding: 'utf8' }).trim();
+          const guestArchive = join(outDir, 'nod-Runtime-win32-x64.tar.gz');
+          let expandedBytes = 0;
+          try {
+            const child = spawn('docker', ['export', cid], { stdio: ['ignore', 'pipe', 'inherit'] });
+            child.stdout.on('data', (chunk) => { expandedBytes += chunk.length; });
+            const done = new Promise((res, rej) => {
+              child.once('error', rej);
+              child.once('close', (code) => (code === 0 ? res() : rej(new Error('docker export failed'))));
+            });
+            await Promise.all([
+              pipeline(child.stdout, createGzip({ level: 6 }), createWriteStream(`${guestArchive}.tmp`)),
+              done,
+            ]);
+            await rename(`${guestArchive}.tmp`, guestArchive);
+          } finally {
+            execFileSync('docker', ['rm', '-f', cid]);
+          }
+
+          const guestSha = await sha256File(guestArchive);
+          manifest.guest = {
+            file: 'guest.tar.gz',
+            bytes: (await stat(guestArchive)).size,
+            expandedBytes,
+            sha256: guestSha,
+          };
+          const fingerprint = createHash('sha256').update(JSON.stringify(manifest)).digest('hex').slice(0, 12);
+          manifest.fingerprint = fingerprint;
+          await writeFile(join(outDir, `runtime-win32-x64-${fingerprint}.json`), JSON.stringify(manifest, null, 2) + '\n');
+          await rm(ctxDir, { recursive: true, force: true });
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-guest
+          path: runtime-out/
+          retention-days: 1
+
+  publish:
+    needs: [build-windows, build-linux, build-windows-guest]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-windows
+          path: release-assets
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-linux
+          path: release-assets
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-windows-guest
+          path: release-assets
+
+      - name: Generate SHA256SUMS.txt
+        run: |
+          cd release-assets
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          name: Nod ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          body: |
+            Native Rust builds of Nod (`amr-ahmed-exe/nod`) with Alpine Linux WSL2 guest runtime, System Tray background mode, automatic SHA-256 verified updates, and low-RAM container tuning.
+
+            ### Included Assets
+            - `nod-windows-x86_64.exe` / `nod-windows-x86_64.zip` — Windows native desktop app (also used by automatic updates)
+            - `nod-linux-x86_64` / `nod-linux-x86_64.tar.gz` — Linux desktop binary
+            - `nod-linux-x86_64-headless` / `nod-linux-x86_64-headless.tar.gz` — Linux `--headless` server binary (zero GUI deps)
+            - `nod-Runtime-win32-x64.tar.gz` + `runtime-win32-x64-*.json` — Alpine 3.21 WSL2 container runtime
+            - `SHA256SUMS.txt` — Verified SHA-256 checksums
+
+            ### Credits
+            Built upon [`n8n-io/nod`](https://github.com/n8n-io/nod) (Apache-2.0) and [`mohamed0s/nod`](https://github.com/mohamed0s/nod).
+          files: release-assets/*
