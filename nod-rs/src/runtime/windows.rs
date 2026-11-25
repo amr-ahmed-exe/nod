@@ -170,7 +170,7 @@ pub fn pick_folder(title: &str, initial: Option<&Path>) -> Result<Option<PathBuf
     #[cfg(not(windows))]
     {
         let _ = (title, initial);
-        return Err("Folder selection is only available on Windows.".into());
+        Err("Folder selection is only available on Windows.".into())
     }
     #[cfg(windows)]
     {
@@ -220,7 +220,7 @@ pub fn pick_runtime_archive(initial: Option<&Path>) -> Result<Option<PathBuf>, S
     #[cfg(not(windows))]
     {
         let _ = initial;
-        return Err("File selection is only available on Windows.".into());
+        Err("File selection is only available on Windows.".into())
     }
     #[cfg(windows)]
     {
@@ -271,7 +271,7 @@ pub fn protect_profile_directory(paths: &[&Path]) -> Result<(), String> {
     #[cfg(not(windows))]
     {
         let _ = paths;
-        return Ok(());
+        Ok(())
     }
     #[cfg(windows)]
     {

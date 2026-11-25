@@ -249,7 +249,6 @@ mod desktop_app {
             .get("resolvedTheme")
             .and_then(Value::as_str)
             .unwrap_or("dark");
-        let initial_is_dark = initial_theme != "light";
         let initial_bg: (u8, u8, u8, u8) = match initial_theme {
             "light" => (250, 250, 250, 255),
             "amoled" => (0, 0, 0, 255),
@@ -257,16 +256,16 @@ mod desktop_app {
             _ => (25, 25, 25, 255),
         };
 
-        let mut window_builder = WindowBuilder::new()
+        let window_builder = WindowBuilder::new()
             .with_title("Nod")
             .with_decorations(false)
             .with_inner_size(LogicalSize::new(1280.0, 820.0))
             .with_min_inner_size(LogicalSize::new(800.0, 600.0));
     #[cfg(target_os = "windows")]
-    {
+    let window_builder = {
         use tao::platform::windows::WindowBuilderExtWindows;
-        window_builder = window_builder.with_undecorated_shadow(true);
-    }
+        window_builder.with_undecorated_shadow(true)
+    };
     let window = window_builder.build(&event_loop)?;
 
     #[cfg(target_os = "windows")]
@@ -275,7 +274,7 @@ mod desktop_app {
         use windows_sys::Win32::Foundation::HWND;
         use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
         let hwnd = window.hwnd() as HWND;
-        let dark: i32 = if initial_is_dark { 1 } else { 0 };
+        let dark: i32 = if initial_theme != "light" { 1 } else { 0 };
         let round: i32 = 2; // DWMWCP_ROUND
         unsafe {
             DwmSetWindowAttribute(
