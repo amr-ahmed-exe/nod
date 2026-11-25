@@ -3,13 +3,17 @@ use std::path::{Path, PathBuf};
 fn main() {
     println!("cargo:rerun-if-changed=assets/nod.ico");
     embed_web();
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
-        let mut resource = winresource::WindowsResource::new();
-        resource.set_icon("assets/nod.ico");
-        resource.set("ProductName", "Nod");
-        resource.set("FileDescription", "Nod");
-        resource.compile().expect("Windows resources");
-    }
+    #[cfg(windows)]
+    embed_windows_resources();
+}
+
+#[cfg(windows)]
+fn embed_windows_resources() {
+    let mut resource = winresource::WindowsResource::new();
+    resource.set_icon("assets/nod.ico");
+    resource.set("ProductName", "Nod");
+    resource.set("FileDescription", "Nod");
+    resource.compile().expect("Windows resources");
 }
 
 fn embed_web() {

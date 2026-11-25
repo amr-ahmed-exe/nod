@@ -528,6 +528,9 @@ impl RuntimeManager {
                 current.insert(k.clone(), v.clone());
             }
         }
+        if let Some(enabled) = patch.get("launchAtLogin").and_then(Value::as_bool) {
+            windows::set_launch_at_login(enabled)?;
+        }
         storage::write_json(&paths.preferences_path, &Value::Object(current))
             .map_err(|err| err.to_string())?;
         let prefs = self.get_preferences();
