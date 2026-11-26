@@ -287,12 +287,23 @@ impl RuntimeManager {
     /// Requests elevated Windows WSL2 installation and reports restart requirement cleanly.
     pub fn install_wsl(&self) -> Status {
         let redactor = self.redactor();
-        self.transition_status(Phase::CheckingWsl, "Installing Windows Subsystem for Linux…", Some(0.05));
+        self.transition_status(
+            Phase::CheckingWsl,
+            "Installing Windows Subsystem for Linux…",
+            Some(0.05),
+        );
         match wsl::install_wsl() {
             Ok(()) => {
+                let probe_ok = Wsl::discover()
+                    .and_then(|wsl| wsl.probe(&redactor))
+                    .is_ok();
+                if probe_ok {
+                    self.log_line("WSL installation completed cleanly; continuing automatic runtime setup.");
+                    return self.prepare(true);
+                }
                 let err = RuntimeError::new(
                     errors::NOD_WSL_REQUIRED,
-                    "Windows Subsystem for Linux was installed. Restart Windows, then open Nod again.",
+                    "WSL has been installed. Restart Windows once, then reopen Nod to finish setup automatically.",
                 )
                 .step("wsl")
                 .needs_wsl()
@@ -300,8 +311,7 @@ impl RuntimeManager {
                 self.fail_status(&err);
             }
             Err(msg) => {
-                let mut err = RuntimeError::wsl_broken(None, msg, &redactor);
-                err = err.restart_required(true);
+                let err = RuntimeError::wsl_broken(None, msg, &redactor);
                 self.fail_status(&err);
             }
         }
@@ -469,23 +479,32 @@ impl RuntimeManager {
             "onboardingPreferenceStep": preference_step,
             "welcome": existing.get("welcome").cloned().unwrap_or_else(|| json!({ "seen": false })),
             "theme": prefs.get("theme").cloned().unwrap_or_else(|| json!("system")),
+            "launchAtLogin": prefs.get("launchAtLogin").cloned().unwrap_or(Value::Bool(false)),
+            "notifications": prefs.get("notifications").cloned().unwrap_or(Value::Bool(true)),
         })
     }
 
-    /// Merges and atomically persists desktop `settings.json`.
     pub fn save_settings(&self, patch: Value) -> Result<Value, String> {
         let paths = self.paths_snapshot();
         let mut current = storage::read_json(&paths.settings_path)
             .and_then(|v| v.as_object().cloned())
             .unwrap_or_default();
+        let mut pref_patch = serde_json::Map::new();
         if let Some(obj) = patch.as_object() {
             for (k, v) in obj {
-                current.insert(k.clone(), v.clone());
+                if matches!(k.as_str(), "theme" | "launchAtLogin" | "notifications") {
+                    pref_patch.insert(k.clone(), v.clone());
+                } else {
+                    current.insert(k.clone(), v.clone());
+                }
             }
         }
         current.insert("version".to_string(), json!(2));
         storage::write_json(&paths.settings_path, &Value::Object(current))
             .map_err(|err| err.to_string())?;
+        if !pref_patch.is_empty() {
+            let _ = self.save_preferences(Value::Object(pref_patch))?;
+        }
         Ok(self.get_settings())
     }
 
@@ -671,13 +690,39 @@ impl RuntimeManager {
                 }
             }
             None => {
-                self.log_line("Local runtime manifest missing; checking official Windows runtime release.");
-                self.transition_status(
-                    Phase::PreparingStorage,
-                    "Fetching Nod Windows runtime information…",
-                    Some(0.10),
-                );
-                assets::fetch_latest_windows_runtime_manifest(&paths, &redactor)?
+                let sidecar = [
+                    std::env::current_exe()
+                        .ok()
+                        .and_then(|p| p.parent().map(|d| d.join("nod-Runtime-win32-x64.tar.gz"))),
+                    std::env::current_exe().ok().and_then(|p| {
+                        p.parent().map(|d| {
+                            d.join("resources")
+                                .join("engine")
+                                .join("windows-runtime")
+                                .join("nod-Runtime-win32-x64.tar.gz")
+                        })
+                    }),
+                ]
+                .into_iter()
+                .flatten()
+                .find(|p| p.is_file());
+                if let Some(archive_path) = sidecar {
+                    self.log_line("Installing bundled Windows runtime archive.");
+                    self.transition_status(
+                        Phase::VerifyingRuntime,
+                        "Preparing bundled Alpine WSL2 runtime…",
+                        Some(0.25),
+                    );
+                    assets::install_runtime_archive(&archive_path, &paths, &redactor)?
+                } else {
+                    self.log_line("Local runtime manifest missing; checking official Windows runtime release.");
+                    self.transition_status(
+                        Phase::PreparingStorage,
+                        "Fetching Nod Windows runtime information…",
+                        Some(0.10),
+                    );
+                    assets::fetch_latest_windows_runtime_manifest(&paths, &redactor)?
+                }
             }
         };
 

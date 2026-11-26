@@ -286,7 +286,50 @@ fn model_endpoint(ctx: &Ctx) -> Reply {
     Reply::ok(models_view(ctx.store))
 }
 
+fn valid_clock_time(value: &str) -> bool {
+    let mut parts = value.split(':');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(hours), Some(minutes), None) => {
+            hours.len() == 2
+                && minutes.len() == 2
+                && hours.parse::<u32>().is_ok_and(|h| h < 24)
+                && minutes.parse::<u32>().is_ok_and(|m| m < 60)
+        }
+        _ => false,
+    }
+}
+
+fn validate_preferences_patch(patch: &Value) -> Result<(), String> {
+    let Some(patch) = patch.as_object() else {
+        return Err("Preferences update must be an object.".to_string());
+    };
+    if let Some(zone) = patch.get("timeZone") {
+        let valid = zone
+            .as_str()
+            .is_some_and(|value| value.parse::<chrono_tz::Tz>().is_ok());
+        if !valid {
+            return Err("Choose a valid IANA time zone, such as Europe/Berlin.".to_string());
+        }
+    }
+    for key in ["quietStart", "quietEnd"] {
+        if let Some(value) = patch.get(key)
+            && !value.as_str().is_some_and(valid_clock_time)
+        {
+            return Err("Quiet hours use a 24-hour time such as 22:00.".to_string());
+        }
+    }
+    for key in ["quietHoursEnabled", "localFilesEnabled", "proactivePaused"] {
+        if patch.get(key).is_some_and(|value| !value.is_boolean()) {
+            return Err(format!("{key} must be true or false."));
+        }
+    }
+    Ok(())
+}
+
 fn preferences_update(ctx: &Ctx) -> Reply {
+    if let Err(message) = validate_preferences_patch(&ctx.body) {
+        return Reply::error(400, message);
+    }
     let mut current = preferences_state(ctx.store);
     if let (Some(target), Some(patch)) = (current.as_object_mut(), ctx.body.as_object()) {
         for (key, value) in patch {
@@ -522,3 +565,24 @@ pub fn provider_name(provider: &str) -> String {
 }
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preferences_patch_rejects_invalid_zone_and_clock_values() {
+        assert!(validate_preferences_patch(&json!({ "timeZone": "Europe/Berlin" })).is_ok());
+        assert!(validate_preferences_patch(&json!({ "timeZone": "Africa/Cairo" })).is_ok());
+        assert!(validate_preferences_patch(&json!({ "timeZone": "Not/AZone" })).is_err());
+        assert!(validate_preferences_patch(&json!({ "timeZone": 42 })).is_err());
+        assert!(validate_preferences_patch(&json!({ "quietStart": "22:00", "quietEnd": "07:00" })).is_ok());
+        assert!(validate_preferences_patch(&json!({ "quietStart": "25:99" })).is_err());
+        assert!(validate_preferences_patch(&json!({ "quietEnd": "7:00" })).is_err());
+        assert!(validate_preferences_patch(&json!({ "quietHoursEnabled": true })).is_ok());
+        assert!(validate_preferences_patch(&json!({ "quietHoursEnabled": "yes" })).is_err());
+        assert!(validate_preferences_patch(&json!({ "localFilesEnabled": false })).is_ok());
+        assert!(validate_preferences_patch(&json!({ "localFilesEnabled": 0 })).is_err());
+        assert!(validate_preferences_patch(&json!([])).is_err());
+    }
+}

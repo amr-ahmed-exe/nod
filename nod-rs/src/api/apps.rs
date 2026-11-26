@@ -5,12 +5,13 @@ use crate::util::{
     uuid,
 };
 use chrono::Duration as ChronoDuration;
+use ed25519_compact::{KeyPair, Seed};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const LINEAR_PLUGIN_JSON: &str = include_str!("../../../src/apps/linear/plugin.json");
 const LINEAR_APP_JSON: &str = include_str!("../../../src/apps/linear/io.n8n.nod/app.json");
@@ -30,6 +31,8 @@ const NOTION_MCP_JSON: &str = include_str!("../../../src/apps/notion/mcp.json");
 const NOTION_ICON_SVG: &str = include_str!("../../../src/apps/notion/io.n8n.nod/icon.svg");
 
 const COMPOSIO_API_BASE: &str = "https://backend.composio.dev/api/v3";
+const COMPOSIO_PROXY_ORIGIN: &str = "https://composio.n8n.cloud";
+const COMPOSIO_PRIVACY_NOTICE: &str = "<p>App data that Nod reads or sends passes through this connection service and Composio. This includes email content for Gmail and Outlook. Both services can read this content. By default, n8n runs the connection service.</p><p>Retention depends on the connection service's settings and Composio plan. When Zero Data Retention is on for the project, covered calls keep request arguments, response data and error text out of Composio execution logs. Composio still processes calls and keeps metadata. Calls through Composio Managed OAuth apps need Enterprise for this coverage. Files, triggers and tool searches have separate rules.</p><p><a href=\"https://nod.n8n.io/docs/trust/privacy/#composio-zero-data-retention\" target=\"_blank\" rel=\"noopener noreferrer\">Read about data handling and retention</a></p>";
 
 #[derive(Clone, Debug)]
 struct BundledAppDef {
@@ -73,11 +76,260 @@ struct ComposioCatalogCache {
     items: Vec<Value>,
 }
 
+#[derive(Clone, Debug)]
+struct ProxyConnectAttempt {
+    capability: String,
+    transaction_id: String,
+    discovery_id: String,
+    slug: String,
+    challenge: String,
+    bridge_key: String,
+    origin: String,
+    expires_at: Instant,
+    bootstrapped: bool,
+    starting: bool,
+}
+
 static COMPOSIO_CACHE: OnceLock<Mutex<Option<ComposioCatalogCache>>> = OnceLock::new();
 static BUNDLED_CACHE: OnceLock<Vec<BundledAppDef>> = OnceLock::new();
+static PROXY_ENROLLED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static PROXY_CLOCK_OFFSET: OnceLock<Mutex<i64>> = OnceLock::new();
+static PROXY_ATTEMPTS: OnceLock<Mutex<HashMap<String, ProxyConnectAttempt>>> = OnceLock::new();
+static PROXY_SESSIONS: OnceLock<Mutex<HashMap<String, (String, Instant)>>> = OnceLock::new();
 
 fn composio_cache() -> &'static Mutex<Option<ComposioCatalogCache>> {
     COMPOSIO_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn proxy_enrolled() -> &'static Mutex<HashSet<String>> {
+    PROXY_ENROLLED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn proxy_clock_offset() -> &'static Mutex<i64> {
+    PROXY_CLOCK_OFFSET.get_or_init(|| Mutex::new(0))
+}
+
+fn proxy_attempts() -> &'static Mutex<HashMap<String, ProxyConnectAttempt>> {
+    PROXY_ATTEMPTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn proxy_sessions() -> &'static Mutex<HashMap<String, (String, Instant)>> {
+    PROXY_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn composio_proxy_origin() -> Option<String> {
+    if let Ok(url) = std::env::var("NOD_COMPOSIO_PROXY_URL") {
+        let trimmed = url.trim().trim_end_matches('/').to_string();
+        if !trimmed.is_empty() {
+            return Some(trimmed);
+        }
+    }
+    if cfg!(test) {
+        None
+    } else {
+        Some(COMPOSIO_PROXY_ORIGIN.to_string())
+    }
+}
+
+fn validated_proxy_origin(origin: &str) -> Result<String, String> {
+    check_public_https_url(origin, false, true)
+        .map(|_| origin.to_string())
+        .map_err(|e| format!("App connection service address is not allowed: {e}"))
+}
+
+fn decode_hex_32(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+fn encode_hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+struct ProxyIdentity {
+    keypair: KeyPair,
+    public_key: String,
+    user_id: String,
+}
+
+fn load_or_create_proxy_identity(store: &Store) -> Result<ProxyIdentity, String> {
+    if let Some(saved) = store.setting("composio_proxy_identity") {
+        let enc = saved
+            .get("seedEnc")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "The app connection identity is incomplete and was left unchanged.".to_string())?;
+        let plain = vault::decrypt_secret(enc)
+            .map_err(|e| format!("Could not unlock the app connection identity: {e}"))?;
+        let seed_bytes = decode_hex_32(plain.trim())
+            .ok_or_else(|| "The app connection identity is damaged and was left unchanged.".to_string())?;
+        let keypair = KeyPair::from_seed(Seed::new(seed_bytes));
+        let pk_bytes = keypair.pk.as_ref();
+        let public_key = base64url_encode(pk_bytes);
+        let user_id = format!("nod_{}", sha256_hex(pk_bytes));
+        return Ok(ProxyIdentity {
+            keypair,
+            public_key,
+            user_id,
+        });
+    }
+
+    let mut seed_bytes = [0u8; 32];
+    getrandom::fill(&mut seed_bytes).map_err(|e| format!("Could not generate app identity: {e}"))?;
+    let keypair = KeyPair::from_seed(Seed::new(seed_bytes));
+    let pk_bytes = keypair.pk.as_ref();
+    let public_key = base64url_encode(pk_bytes);
+    let user_id = format!("nod_{}", sha256_hex(pk_bytes));
+    let seed_enc = vault::encrypt_secret(&encode_hex_bytes(&seed_bytes))?;
+    store.set_setting(
+        "composio_proxy_identity",
+        &json!({
+            "publicKey": public_key,
+            "userId": user_id,
+            "seedEnc": seed_enc,
+        }),
+    );
+    Ok(ProxyIdentity {
+        keypair,
+        public_key,
+        user_id,
+    })
+}
+
+fn proxy_request_once(
+    agent: &ureq::Agent,
+    identity: &ProxyIdentity,
+    origin: &str,
+    method: &str,
+    path_and_query: &str,
+    body_bytes: &[u8],
+) -> Result<(u16, Option<String>, String), String> {
+    let offset = proxy_clock_offset().lock().map(|g| *g).unwrap_or(0);
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+        + offset;
+    let timestamp = now_secs.to_string();
+    let request_id = uuid();
+    let body_hash = sha256_hex(body_bytes);
+    let canonical = format!(
+        "nod-composio-v1\n{method}\n{origin}\n{path_and_query}\n{timestamp}\n{request_id}\n{body_hash}"
+    );
+    let sig = identity.keypair.sk.sign(canonical.as_bytes(), None);
+    let sig_b64 = base64url_encode(sig.as_ref());
+
+    let url = format!("{origin}{path_and_query}");
+    let mut req = agent
+        .request(method, &url)
+        .set("Accept", "application/json")
+        .set("x-nod-public-key", &identity.public_key)
+        .set("x-nod-timestamp", &timestamp)
+        .set("x-nod-request-id", &request_id)
+        .set("x-nod-signature", &sig_b64);
+    if !body_bytes.is_empty() {
+        req = req.set("Content-Type", "application/json");
+    }
+
+    let resp = if body_bytes.is_empty() {
+        req.call()
+    } else {
+        req.send_bytes(body_bytes)
+    };
+    match resp {
+        Ok(r) => {
+            let status = r.status();
+            let date_hdr = r.header("date").map(str::to_string);
+            let txt = r.into_string().map_err(|e| format!("Could not read proxy response: {e}"))?;
+            Ok((status, date_hdr, txt))
+        }
+        Err(ureq::Error::Status(status, r)) => {
+            let date_hdr = r.header("date").map(str::to_string);
+            let txt = r.into_string().unwrap_or_default();
+            Ok((status, date_hdr, txt))
+        }
+        Err(ureq::Error::Transport(t)) => Err(format!("Could not reach app connection service: {t}")),
+    }
+}
+
+fn proxy_signed_request(
+    store: &Store,
+    origin: &str,
+    method: &str,
+    path_and_query: &str,
+    body: Option<&Value>,
+) -> Result<Value, String> {
+    let origin = validated_proxy_origin(origin)?;
+    let identity = load_or_create_proxy_identity(store)?;
+    let agent = ureq::AgentBuilder::new()
+        .redirects(0)
+        .timeout_connect(Duration::from_secs(8))
+        .timeout(Duration::from_secs(20))
+        .build();
+    let payload_bytes = match body {
+        Some(v) => v.to_string().into_bytes(),
+        None => Vec::new(),
+    };
+
+    if !path_and_query.starts_with("/v2/access/") {
+        let enrollment_key = format!("{origin}|{}", identity.public_key);
+        let already = proxy_enrolled()
+            .lock()
+            .map(|g| g.contains(&enrollment_key))
+            .unwrap_or(false);
+        if !already {
+            let enrolled = proxy_signed_request(store, &origin, "POST", "/v2/access/enroll", Some(&json!({})))?;
+            if enrolled.get("state").and_then(Value::as_str) != Some("enabled")
+                || enrolled.get("userId").and_then(Value::as_str) != Some(identity.user_id.as_str())
+            {
+                return Err("App connection service enrollment could not be verified.".to_string());
+            }
+            if let Ok(mut guard) = proxy_enrolled().lock() {
+                guard.insert(enrollment_key);
+            }
+        }
+    }
+
+    let (mut status, mut date_hdr, mut text_body) =
+        proxy_request_once(&agent, &identity, &origin, method, path_and_query, &payload_bytes)?;
+    if status == 401
+        && let Ok(parsed) = serde_json::from_str::<Value>(&text_body)
+        && parsed.get("error").and_then(Value::as_str) == Some("expired_authentication")
+        && let Some(date_str) = date_hdr.as_deref()
+        && let Ok(dt) = chrono::DateTime::parse_from_rfc2822(date_str)
+    {
+        let local_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        if let Ok(mut g) = proxy_clock_offset().lock() {
+            *g = dt.timestamp() - local_secs;
+        }
+        (status, date_hdr, text_body) =
+            proxy_request_once(&agent, &identity, &origin, method, path_and_query, &payload_bytes)?;
+    }
+    let _ = date_hdr;
+
+    if !(200..300).contains(&status) {
+        let detail = serde_json::from_str::<Value>(&text_body)
+            .ok()
+            .and_then(|v| {
+                v.get("message")
+                    .or_else(|| v.get("error"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| text_body.chars().take(240).collect());
+        return Err(format!("App connection service returned HTTP {status}: {detail}"));
+    }
+
+    serde_json::from_str(&text_body)
+        .map_err(|_| "App connection service returned invalid JSON.".to_string())
 }
 
 fn composio_api_key(store: &Store) -> Option<String> {
@@ -443,7 +695,96 @@ fn is_valid_composio_logo(url: &str) -> bool {
             || url.starts_with("https://assets.composio.dev/logos/"))
 }
 
-fn fetch_composio_catalog(api_key: &str) -> Result<Vec<Value>, String> {
+fn parse_composio_toolkit_items(items: &[Value], out: &mut Vec<Value>) {
+    for entry in items {
+        let slug = entry
+            .get("slug")
+            .and_then(Value::as_str)
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        if !is_valid_slug(&slug) || slug == "notion_mcp" {
+            continue;
+        }
+        if entry.get("no_auth").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let auth_schemes = entry
+            .get("auth_schemes")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(|s| s.to_ascii_uppercase())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !auth_schemes.is_empty() && auth_schemes.iter().all(|s| s == "NO_AUTH") {
+            continue;
+        }
+        let managed = entry
+            .get("composio_managed_auth_schemes")
+            .and_then(Value::as_array)
+            .map(|a| !a.is_empty())
+            .unwrap_or(false);
+        if !managed && !auth_schemes.iter().any(|s| s == "DCR_OAUTH") {
+            continue;
+        }
+        let Some(name) = entry
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && s.len() <= 200)
+        else {
+            continue;
+        };
+        let description = entry
+            .pointer("/meta/description")
+            .and_then(Value::as_str)
+            .map(|s| s.chars().take(1000).collect::<String>())
+            .unwrap_or_default();
+        let logo = entry
+            .pointer("/meta/logo")
+            .and_then(Value::as_str)
+            .filter(|u| is_valid_composio_logo(u));
+        let categories: Vec<String> = entry
+            .pointer("/meta/categories")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .take(32)
+                    .filter_map(|c| {
+                        c.get("name")
+                            .and_then(Value::as_str)
+                            .or_else(|| c.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty() && s.len() <= 80)
+                            .map(str::to_string)
+                    })
+                    .take(12)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut item = json!({
+            "slug": slug,
+            "name": name,
+            "description": description,
+            "categories": categories,
+            "status": "disconnected",
+            "triggersEnabled": false,
+            "supportsTriggers": false,
+        });
+        if let Some(logo_url) = logo {
+            item["logoUrl"] = json!(logo_url);
+        }
+        out.push(item);
+    }
+}
+
+fn fetch_composio_pages<F>(fetch_page: F) -> Result<Vec<Value>, String>
+where
+    F: Fn(&str) -> Result<Value, String>,
+{
     if let Ok(guard) = composio_cache().lock()
         && let Some(cached) = guard.as_ref()
         && cached.fetched_at.elapsed() < Duration::from_secs(15 * 60)
@@ -451,117 +792,21 @@ fn fetch_composio_catalog(api_key: &str) -> Result<Vec<Value>, String> {
         return Ok(cached.items.clone());
     }
 
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(6))
-        .timeout(Duration::from_secs(10))
-        .build();
     let mut result = Vec::new();
     let mut seen_cursors = HashSet::new();
     let mut cursor: Option<String> = None;
 
     for _ in 0..10 {
-        let mut url = format!("{COMPOSIO_API_BASE}/toolkits?type=native&include_deprecated=false&limit=1000");
+        let mut query = String::from("type=native&include_deprecated=false&limit=1000");
         if let Some(c) = cursor.as_deref() {
-            url.push_str("&cursor=");
-            url.push_str(&url_encode_component(c));
+            query.push_str("&cursor=");
+            query.push_str(&url_encode_component(c));
         }
-        let resp = agent
-            .get(&url)
-            .set("x-api-key", api_key)
-            .set("Accept", "application/json")
-            .call()
-            .map_err(|e| format!("Could not load Composio catalog: {e}"))?;
-        let text_body = resp
-            .into_string()
-            .map_err(|e| format!("Could not read Composio catalog response: {e}"))?;
-        let parsed: Value = serde_json::from_str(&text_body)
-            .map_err(|_| "Composio returned invalid JSON for catalog.".to_string())?;
+        let parsed = fetch_page(&query)?;
         let Some(items) = parsed.get("items").and_then(Value::as_array) else {
-            break;
+            return Err("The app catalog response did not include a toolkit list.".to_string());
         };
-        for entry in items {
-            let slug = entry
-                .get("slug")
-                .and_then(Value::as_str)
-                .map(|s| s.to_ascii_lowercase())
-                .unwrap_or_default();
-            if !is_valid_slug(&slug) || slug == "notion_mcp" {
-                continue;
-            }
-            if entry.get("no_auth").and_then(Value::as_bool) == Some(true) {
-                continue;
-            }
-            let auth_schemes = entry
-                .get("auth_schemes")
-                .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(Value::as_str)
-                        .map(|s| s.to_ascii_uppercase())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            if !auth_schemes.is_empty() && auth_schemes.iter().all(|s| s == "NO_AUTH") {
-                continue;
-            }
-            let managed = entry
-                .get("composio_managed_auth_schemes")
-                .and_then(Value::as_array)
-                .map(|a| !a.is_empty())
-                .unwrap_or(false);
-            if !managed && !auth_schemes.iter().any(|s| s == "DCR_OAUTH") {
-                continue;
-            }
-            let Some(name) = entry
-                .get("name")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty() && s.len() <= 200)
-            else {
-                continue;
-            };
-            let description = entry
-                .pointer("/meta/description")
-                .and_then(Value::as_str)
-                .map(|s| s.chars().take(1000).collect::<String>())
-                .unwrap_or_default();
-            let logo = entry
-                .pointer("/meta/logo")
-                .and_then(Value::as_str)
-                .filter(|u| is_valid_composio_logo(u));
-            let categories: Vec<String> = entry
-                .pointer("/meta/categories")
-                .and_then(Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .take(32)
-                        .filter_map(|c| {
-                            c.get("name")
-                                .and_then(Value::as_str)
-                                .or_else(|| c.as_str())
-                                .map(str::trim)
-                                .filter(|s| !s.is_empty() && s.len() <= 80)
-                                .map(str::to_string)
-                        })
-                        .take(12)
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            let mut item = json!({
-                "slug": slug,
-                "name": name,
-                "description": description,
-                "categories": categories,
-                "status": "disconnected",
-                "triggersEnabled": false,
-                "supportsTriggers": false,
-            });
-            if let Some(logo_url) = logo {
-                item["logoUrl"] = json!(logo_url);
-            }
-            result.push(item);
-        }
+        parse_composio_toolkit_items(items, &mut result);
         cursor = parsed
             .get("next_cursor")
             .and_then(Value::as_str)
@@ -577,6 +822,10 @@ fn fetch_composio_catalog(api_key: &str) -> Result<Vec<Value>, String> {
         }
     }
 
+    if cursor.is_some() {
+        return Err("The app catalog did not finish loading every page.".to_string());
+    }
+
     if let Ok(mut guard) = composio_cache().lock() {
         *guard = Some(ComposioCatalogCache {
             fetched_at: Instant::now(),
@@ -584,6 +833,35 @@ fn fetch_composio_catalog(api_key: &str) -> Result<Vec<Value>, String> {
         });
     }
     Ok(result)
+}
+
+fn fetch_composio_catalog(api_key: &str) -> Result<Vec<Value>, String> {
+    let agent = ureq::AgentBuilder::new()
+        .redirects(0)
+        .timeout_connect(Duration::from_secs(6))
+        .timeout(Duration::from_secs(10))
+        .build();
+    fetch_composio_pages(|query| {
+        let url = format!("{COMPOSIO_API_BASE}/toolkits?{query}");
+        let resp = agent
+            .get(&url)
+            .set("x-api-key", api_key)
+            .set("Accept", "application/json")
+            .call()
+            .map_err(|e| format!("Could not load Composio catalog: {e}"))?;
+        let text_body = resp
+            .into_string()
+            .map_err(|e| format!("Could not read Composio catalog response: {e}"))?;
+        serde_json::from_str(&text_body)
+            .map_err(|_| "Composio returned invalid JSON for catalog.".to_string())
+    })
+}
+
+fn fetch_composio_proxy_catalog(store: &Store, proxy_origin: &str) -> Result<Vec<Value>, String> {
+    fetch_composio_pages(|query| {
+        let path_and_query = format!("/v2/api/v3.1/toolkits?{query}");
+        proxy_signed_request(store, proxy_origin, "GET", &path_and_query, None)
+    })
 }
 
 pub fn handle(ctx: &Ctx) -> Option<Reply> {
@@ -602,6 +880,10 @@ pub fn handle(ctx: &Ctx) -> Option<Reply> {
         ("GET", "/api/speech") | ("POST", "/api/speech/prepare") | ("POST", "/api/speech/voices/refresh") => {
             Some(speech(ctx))
         }
+        ("POST", "/api/speech/preview") => Some(Reply::error(
+            501,
+            "Voice preview is not available in the native build.",
+        )),
         _ => dispatch_dynamic(ctx),
     }
 }
@@ -609,6 +891,10 @@ pub fn handle(ctx: &Ctx) -> Option<Reply> {
 fn dispatch_dynamic(ctx: &Ctx) -> Option<Reply> {
     let method = ctx.method;
     let path = ctx.path;
+
+    if let Some(capability) = path.strip_prefix("/api/apps/connect/") {
+        return Some(proxy_connect_bridge(ctx, capability));
+    }
 
     if let Some(rest) = path.strip_prefix("/api/apps/catalog/")
         && let Some(slug) = rest.strip_suffix("/icon")
@@ -728,6 +1014,19 @@ fn catalog(ctx: &Ctx) -> Reply {
     let mut by_slug: HashMap<String, Value> = HashMap::new();
     if let Some(api_key) = composio_api_key(ctx.store) {
         match fetch_composio_catalog(&api_key) {
+            Ok(items) => {
+                for mut item in items {
+                    let slug = text(&item, "slug");
+                    if connected_slugs.contains(&slug) {
+                        item["status"] = json!("connected");
+                    }
+                    by_slug.insert(slug, item);
+                }
+            }
+            Err(err) => return Reply::error(502, err),
+        }
+    } else if let Some(proxy_origin) = composio_proxy_origin() {
+        match fetch_composio_proxy_catalog(ctx.store, &proxy_origin) {
             Ok(items) => {
                 for mut item in items {
                     let slug = text(&item, "slug");
@@ -943,47 +1242,335 @@ fn connect_catalog_app(ctx: &Ctx, slug: &str) -> Reply {
         }));
     }
 
-    let Some(api_key) = composio_api_key(ctx.store) else {
+    if let Some(api_key) = composio_api_key(ctx.store) {
+        let state = random_base64url(32);
+        let callback_url = format!(
+            "{}/api/apps/callback?state={}",
+            ctx.live.origin(),
+            url_encode_component(&state)
+        );
+        return match start_composio_link(&api_key, slug, &callback_url, ctx.owner) {
+            Ok((redirect_url, connected_account_id)) => {
+                let id = uuid();
+                let state_hash = sha256_hex(state.as_bytes());
+                let link_hash = sha256_hex(redirect_url.as_bytes());
+                let expires_at = iso(crate::util::now() + ChronoDuration::minutes(10));
+                let record = json!({
+                    "id": id,
+                    "service": slug,
+                    "name": slug,
+                    "kind": "composio",
+                    "composioAccountId": connected_account_id,
+                    "oauthStatus": "pending",
+                    "oauthStateHash": state_hash,
+                    "linkHash": link_hash,
+                    "callbackReturnTo": return_to,
+                    "expiresAt": expires_at,
+                });
+                if let Err(err) = ctx.store.put("app_discoveries", &id, &record) {
+                    return Reply::error(500, err);
+                }
+                Reply::ok(json!({
+                    "url": redirect_url,
+                    "attempt": state,
+                }))
+            }
+            Err(err) => Reply::error(502, err),
+        };
+    }
+
+    let Some(proxy_origin) = composio_proxy_origin() else {
         return Reply::error(
             503,
             "Configure COMPOSIO_API_KEY to connect managed apps, or use bundled apps (Linear, Notion, n8n) and Connect MCP.",
         );
     };
 
-    let state = random_base64url(32);
-    let callback_url = format!(
-        "{}/api/apps/callback?state={}",
-        ctx.live.origin(),
-        url_encode_component(&state)
-    );
-    match start_composio_link(&api_key, slug, &callback_url, ctx.owner) {
-        Ok((redirect_url, connected_account_id)) => {
-            let id = uuid();
-            let state_hash = sha256_hex(state.as_bytes());
-            let link_hash = sha256_hex(redirect_url.as_bytes());
-            let expires_at = iso(crate::util::now() + ChronoDuration::minutes(10));
-            let record = json!({
-                "id": id,
-                "service": slug,
-                "name": slug,
-                "kind": "composio",
-                "composioAccountId": connected_account_id,
-                "oauthStatus": "pending",
-                "oauthStateHash": state_hash,
-                "linkHash": link_hash,
-                "callbackReturnTo": return_to,
-                "expiresAt": expires_at,
-            });
-            if let Err(err) = ctx.store.put("app_discoveries", &id, &record) {
-                return Reply::error(500, err);
-            }
-            Reply::ok(json!({
-                "url": redirect_url,
-                "attempt": state,
-            }))
-        }
-        Err(err) => Reply::error(502, err),
+    let (display_name, _, _) = catalog_metadata_for_slug(slug);
+    let capability = random_base64url(32);
+    let transaction_id = random_base64url(32);
+    let challenge = random_base64url(32);
+    let bridge_key = random_base64url(32);
+    let disc_id = uuid();
+    let connect_url = format!("{}/api/apps/connect/{capability}", ctx.live.origin());
+    let state_hash = sha256_hex(transaction_id.as_bytes());
+    let link_hash = sha256_hex(connect_url.as_bytes());
+    let expires_at = iso(crate::util::now() + ChronoDuration::minutes(10));
+    let record = json!({
+        "id": disc_id,
+        "service": slug,
+        "name": display_name,
+        "kind": "composio_proxy",
+        "proxyOrigin": proxy_origin,
+        "challenge": challenge,
+        "oauthStatus": "pending",
+        "oauthStateHash": state_hash,
+        "linkHash": link_hash,
+        "callbackReturnTo": return_to,
+        "expiresAt": expires_at,
+    });
+    if let Err(err) = ctx.store.put("app_discoveries", &disc_id, &record) {
+        return Reply::error(500, err);
     }
+
+    if let Ok(mut attempts) = proxy_attempts().lock() {
+        attempts.retain(|_, a| a.expires_at > Instant::now());
+        attempts.insert(
+            capability.clone(),
+            ProxyConnectAttempt {
+                capability,
+                transaction_id: transaction_id.clone(),
+                discovery_id: disc_id,
+                slug: slug.to_string(),
+                challenge,
+                bridge_key,
+                origin: ctx.live.origin().to_string(),
+                expires_at: Instant::now() + Duration::from_secs(600),
+                bootstrapped: false,
+                starting: false,
+            },
+        );
+    }
+
+    Reply::ok(json!({
+        "url": connect_url,
+        "attempt": transaction_id,
+    }))
+}
+
+fn is_b64url_43(value: &str) -> bool {
+    value.len() == 43
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn catalog_metadata_for_slug(slug: &str) -> (String, Option<String>, Vec<String>) {
+    if let Ok(guard) = composio_cache().lock()
+        && let Some(cached) = guard.as_ref()
+        && let Some(item) = cached.items.iter().find(|i| text(i, "slug") == slug)
+    {
+        let name = text(item, "name");
+        let logo = item.get("logoUrl").and_then(Value::as_str).map(str::to_string);
+        let cats = item
+            .get("categories")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            .unwrap_or_default();
+        if !name.is_empty() {
+            return (name, logo, cats);
+        }
+    }
+    (slug.replace('_', " "), None, Vec::new())
+}
+
+fn loopback_endpoint_spec(origin: &str) -> Option<Value> {
+    let parsed = parse_url(origin).ok()?;
+    let host_kind = match parsed.host.as_str() {
+        "localhost" => "localhost",
+        "127.0.0.1" => "ipv4",
+        "[::1]" => "ipv6",
+        _ => return None,
+    };
+    let port = parsed
+        .port
+        .unwrap_or(if parsed.scheme == "https" { 443 } else { 80 });
+    Some(json!({
+        "type": "loopback",
+        "host": host_kind,
+        "port": port,
+    }))
+}
+
+fn render_proxy_connect_html(
+    broker_origin: &str,
+    id: &str,
+    expires_at_ms: u64,
+    bridge_key: &str,
+    nonce: &str,
+) -> String {
+    let values = json!({
+        "brokerOrigin": broker_origin,
+        "id": id,
+        "expiresAt": expires_at_ms,
+        "bridgeKey": bridge_key,
+    })
+    .to_string()
+    .replace('<', "\\u003c");
+    format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Connect your app · Nod</title><style nonce="{nonce}">:root{{color-scheme:light dark}}body{{font:16px system-ui;margin:0;min-height:100svh;display:grid;place-items:center;background:light-dark(#fafafa,#191919);color:light-dark(#191919,#fafafa)}}main{{max-width:360px;padding:32px;text-align:center}}h1{{font-size:21px;font-weight:550;letter-spacing:-.4px}}p{{line-height:1.6;color:light-dark(#676767,#bfbfbf)}}button{{font:inherit;padding:12px 20px;border:0;border-radius:8px;background:light-dark(#191919,#fafafa);color:light-dark(#fafafa,#191919);cursor:pointer}}button:disabled{{opacity:.5;cursor:default}}a{{color:inherit;text-underline-offset:3px}}</style></head><body><main><h1>Connect your app</h1>{COMPOSIO_PRIVACY_NOTICE}<p id="status" role="status">Review the data path, then continue to the service’s permission screen.</p><button id="connect" type="button">Continue to sign in</button></main><script nonce="{nonce}">
+const {{brokerOrigin,id,expiresAt,bridgeKey}}={values};
+const button=document.getElementById('connect');
+const status=document.getElementById('status');
+let popup,key,started=false,signed=false,deadline=expiresAt;
+const valid=()=>{{if(Date.now()>=deadline)throw new Error();}};
+const fail=(message)=>{{button.disabled=true;status.textContent=message||'Sign-in could not be completed. Return to Nod and try again.';popup?.close();}};
+const encoded=(bytes)=>btoa(String.fromCharCode(...bytes)).replaceAll('+','-').replaceAll('/','_').replaceAll('=','');
+window.addEventListener('message',async(event)=>{{
+if(!key||signed||event.origin!==brokerOrigin||event.source!==popup)return;
+const value=event.data;
+if(!value||value.type!=='nod:proxy-connect:challenge'||value.id!==id||typeof value.challenge!=='string'||value.challenge.length>512)return;
+const parts=value.challenge.split('\n');
+if(parts.length!==5||parts[0]!=='nod-proxy-connect-v2'||parts[1]!==id||parts[2]!==location.origin||!/^[a-f0-9]{{64}}$/.test(parts[3])||!/^[A-Za-z0-9_-]{{43}}$/.test(parts[4]))return;
+signed=true;
+try{{valid();const signature=new Uint8Array(await crypto.subtle.sign({{name:'ECDSA',hash:'SHA-256'}},key,new TextEncoder().encode(value.challenge)));valid();if(signature.length!==64)throw new Error();key=undefined;popup.postMessage({{type:'nod:proxy-connect:proof',id,signature:encoded(signature)}},brokerOrigin);status.textContent='Finish signing in in the other window. You can then return to Nod.';}}catch{{fail();}}
+}});
+button.addEventListener('click',async()=>{{
+if(started)return;
+try{{valid();popup=window.open('about:blank','_blank','popup,width=520,height=720');if(!popup){{status.textContent='Allow popups for Nod, then select Continue to sign in.';return;}}started=true;button.disabled=true;
+const pair=await crypto.subtle.generateKey({{name:'ECDSA',namedCurve:'P-256'}},false,['sign','verify']);valid();key=pair.privateKey;
+const response=await fetch(location.pathname,{{method:'POST',credentials:'same-origin',headers:{{'X-Nod-Bridge':bridgeKey,'Content-Type':'application/json'}},body:JSON.stringify({{browserKey:await crypto.subtle.exportKey('jwk',pair.publicKey)}})}});if(!response.ok){{const reply=await response.json().catch(()=>({{}}));throw Object.assign(new Error(),{{reply:typeof reply?.error==='string'?reply.error.slice(0,300):''}});}}
+const attempt=await response.json();const target=new URL(attempt.url);if(attempt.id!==id||!Number.isSafeInteger(attempt.expiresAt)||target.origin!==brokerOrigin||target.pathname!=='/v2/connect/pair'||target.searchParams.size!==1||!target.searchParams.get('ticket')||target.username||target.password||target.hash)throw new Error();deadline=Math.min(deadline,attempt.expiresAt);valid();if(popup.closed)throw new Error();popup.location.replace(target.href);status.textContent='Finish signing in in the other window.';
+}}catch(error){{key=undefined;fail(error?.reply);}}
+}});
+setTimeout(()=>{{key=undefined;button.disabled=true;if(!signed)fail();}},Math.max(0,expiresAt-Date.now()));
+</script></body></html>"#
+    )
+}
+
+fn proxy_connect_bridge(ctx: &Ctx, capability: &str) -> Reply {
+    if !is_b64url_43(capability) {
+        return Reply::error(403, "This app connection is unavailable.");
+    }
+    let Some(proxy_origin) = composio_proxy_origin() else {
+        return Reply::error(403, "This app connection is unavailable.");
+    };
+    let nonce = random_base64url(24);
+    let csp = format!(
+        "default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    );
+
+    if ctx.method == "GET" {
+        let mut snapshot: Option<(String, String, u64)> = None;
+        if let Ok(mut guard) = proxy_attempts().lock()
+            && let Some(attempt) = guard.get_mut(capability)
+            && attempt.expires_at > Instant::now()
+            && !attempt.starting
+        {
+            attempt.bootstrapped = true;
+            let remaining_ms = attempt
+                .expires_at
+                .saturating_duration_since(Instant::now())
+                .as_millis() as u64;
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            snapshot = Some((
+                attempt.transaction_id.clone(),
+                attempt.bridge_key.clone(),
+                now_ms.saturating_add(remaining_ms),
+            ));
+        }
+        let Some((tx_id, bridge_key, exp_ms)) = snapshot else {
+            return Reply::error(403, "This app connection is unavailable.");
+        };
+        let html = render_proxy_connect_html(&proxy_origin, &tx_id, exp_ms, &bridge_key, &nonce);
+        return Reply::text(200, html, "text/html; charset=utf-8")
+            .with_header("Referrer-Policy", "no-referrer")
+            .with_header("Content-Security-Policy", csp);
+    }
+
+    if ctx.method != "POST" {
+        return Reply::error(405, "Method not allowed.");
+    }
+
+    let header_bridge = ctx.query.get("__x_nod_bridge").map(String::as_str).unwrap_or("");
+    let req_origin = ctx.query.get("__req_origin").map(String::as_str).unwrap_or("");
+    let attempt_info = {
+        let Ok(mut guard) = proxy_attempts().lock() else {
+            return Reply::error(500, "Connection state unavailable.");
+        };
+        let Some(attempt) = guard.get_mut(capability) else {
+            return Reply::error(403, "This app connection is unavailable.");
+        };
+        if !attempt.bootstrapped
+            || attempt.starting
+            || attempt.expires_at <= Instant::now()
+            || header_bridge != attempt.bridge_key
+            || (!req_origin.is_empty() && req_origin != attempt.origin)
+        {
+            return Reply::error(403, "This app connection is unavailable.");
+        }
+        attempt.starting = true;
+        attempt.clone()
+    };
+
+    let Some(bk) = ctx.body.get("browserKey").and_then(Value::as_object) else {
+        return Reply::error(400, "Invalid browser connection key.");
+    };
+    let kty = bk.get("kty").and_then(Value::as_str).unwrap_or("");
+    let crv = bk.get("crv").and_then(Value::as_str).unwrap_or("");
+    let x = bk.get("x").and_then(Value::as_str).unwrap_or("");
+    let y = bk.get("y").and_then(Value::as_str).unwrap_or("");
+    if kty != "EC" || crv != "P-256" || !is_b64url_43(x) || !is_b64url_43(y) {
+        return Reply::error(400, "Invalid browser connection key.");
+    }
+
+    let endpoint_spec = loopback_endpoint_spec(&attempt_info.origin).unwrap_or_else(|| {
+        json!({
+            "type": "https",
+            "url": format!("{}/api/apps/callback", attempt_info.origin),
+        })
+    });
+    let ui_origin_spec = loopback_endpoint_spec(&attempt_info.origin).unwrap_or_else(|| {
+        json!({
+            "type": "https",
+            "url": attempt_info.origin,
+        })
+    });
+
+    let start_payload = json!({
+        "toolkit": attempt_info.slug,
+        "callback": endpoint_spec,
+        "transactionId": attempt_info.transaction_id,
+        "challenge": attempt_info.challenge,
+        "browserKey": { "kty": "EC", "crv": "P-256", "x": x, "y": y },
+        "uiOrigin": ui_origin_spec,
+    });
+
+    let result = match proxy_signed_request(
+        ctx.store,
+        &proxy_origin,
+        "POST",
+        "/v2/connect/start",
+        Some(&start_payload),
+    ) {
+        Ok(val) => val,
+        Err(err) => {
+            if let Ok(mut guard) = proxy_attempts().lock() {
+                guard.remove(&attempt_info.capability);
+            }
+            ctx.store.delete("app_discoveries", &attempt_info.discovery_id);
+            return Reply::error(400, err);
+        }
+    };
+
+    let redirect_url = text(&result, "redirectUrl");
+    let ret_tx = text(&result, "transactionId");
+    if ret_tx != attempt_info.transaction_id
+        || !redirect_url.starts_with(&format!("{proxy_origin}/v2/connect/pair?ticket="))
+    {
+        if let Ok(mut guard) = proxy_attempts().lock() {
+            guard.remove(&attempt_info.capability);
+        }
+        return Reply::error(400, "The app sign-in address could not be verified.");
+    }
+
+    let remaining_ms = attempt_info
+        .expires_at
+        .saturating_duration_since(Instant::now())
+        .as_millis() as u64;
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    Reply::ok(json!({
+        "id": attempt_info.transaction_id,
+        "url": redirect_url,
+        "expiresAt": now_ms.saturating_add(remaining_ms),
+    }))
 }
 
 fn start_composio_link(
@@ -1757,6 +2344,7 @@ fn complete_discovery(ctx: &Ctx, id: &str) -> Reply {
 fn oauth_callback(ctx: &Ctx) -> Reply {
     let state = ctx.param("state").unwrap_or_default();
     let code = ctx.param("code").unwrap_or_default();
+    let completion_token = ctx.param("completion_token").unwrap_or_default();
     let oauth_err = ctx.param("error").unwrap_or_default();
     let iss = ctx.param("iss").unwrap_or_default();
     let state_hash = sha256_hex(state.as_bytes());
@@ -1769,12 +2357,120 @@ fn oauth_callback(ctx: &Ctx) -> Reply {
     else {
         return Reply::redirect("/connected.html?connection=expired&desktop=1");
     };
+    let expired = parse_iso(&text(&disc, "expiresAt"))
+        .map(|exp| exp <= crate::util::now())
+        .unwrap_or(false);
+    if expired {
+        return Reply::redirect("/connected.html?connection=expired&desktop=1");
+    }
 
     let disc_id = text(&disc, "id");
     let slug = text(&disc, "service");
     let name = text(&disc, "name");
     let is_desktop = text(&disc, "callbackReturnTo") == "desktop";
     let desktop_q = if is_desktop { "&desktop=1" } else { "" };
+
+    if text(&disc, "kind") == "composio_proxy" {
+        if !oauth_err.is_empty() || completion_token.is_empty() {
+            let outcome = if oauth_err == "access_denied" {
+                "cancelled"
+            } else {
+                "failed"
+            };
+            if let Some(obj) = disc.as_object_mut() {
+                obj.insert("oauthStatus".to_string(), json!(outcome));
+                obj.insert(
+                    "oauthError".to_string(),
+                    if outcome == "cancelled" {
+                        Value::Null
+                    } else {
+                        json!("Sign-in did not finish.")
+                    },
+                );
+                obj.insert("oauthStateHash".to_string(), Value::Null);
+            }
+            let _ = ctx.store.put("app_discoveries", &disc_id, &disc);
+            return Reply::redirect(format!(
+                "/connected.html?connection={outcome}&service={}&serviceName={}&attempt={}{desktop_q}",
+                url_encode_component(&slug),
+                url_encode_component(&name),
+                url_encode_component(&state),
+            ));
+        }
+
+        let proxy_origin = text(&disc, "proxyOrigin");
+        let challenge = text(&disc, "challenge");
+        let complete_res = proxy_signed_request(
+            ctx.store,
+            &proxy_origin,
+            "POST",
+            "/v2/connect/complete",
+            Some(&json!({
+                "completionToken": completion_token,
+                "transactionId": state,
+                "challenge": challenge,
+            })),
+        );
+        return match complete_res {
+            Ok(done)
+                if text(&done, "toolkit") == slug
+                    && text(&done, "status") == "ACTIVE"
+                    && !text(&done, "connectedAccountId").is_empty() =>
+            {
+                let conn_id = text(&done, "connectedAccountId");
+                let (cat_name, logo_opt, categories) = catalog_metadata_for_slug(&slug);
+                let final_name = if name.is_empty() { cat_name } else { name };
+                let mut record = json!({
+                    "id": uuid(),
+                    "connectionId": conn_id,
+                    "slug": slug,
+                    "name": final_name,
+                    "kind": "composio_proxy",
+                    "proxyOrigin": proxy_origin,
+                    "description": "",
+                    "categories": categories,
+                    "status": "connected",
+                    "triggersEnabled": false,
+                    "supportsTriggers": false,
+                    "accountName": final_name,
+                    "connectedAt": iso_now(),
+                });
+                if let Some(logo) = logo_opt {
+                    record["logoUrl"] = json!(logo);
+                }
+                let _ = ctx.store.put("apps", &text(&record, "id"), &record);
+                if let Some(obj) = disc.as_object_mut() {
+                    obj.insert("oauthStatus".to_string(), json!("connected"));
+                    obj.insert("oauthStateHash".to_string(), Value::Null);
+                }
+                let _ = ctx.store.put("app_discoveries", &disc_id, &disc);
+                if let Ok(mut attempts) = proxy_attempts().lock() {
+                    attempts.retain(|_, a| a.discovery_id != disc_id);
+                }
+                notify_apps(ctx);
+                Reply::redirect(format!(
+                    "/connected.html?connection=connected&service={}&serviceName={}&attempt={}{desktop_q}",
+                    url_encode_component(&slug),
+                    url_encode_component(&final_name),
+                    url_encode_component(&state),
+                ))
+            }
+            Ok(_) | Err(_) => {
+                if let Some(obj) = disc.as_object_mut() {
+                    obj.insert("oauthStatus".to_string(), json!("failed"));
+                    obj.insert("oauthError".to_string(), json!("The connected app could not be verified."));
+                    obj.insert("oauthStateHash".to_string(), Value::Null);
+                }
+                let _ = ctx.store.put("app_discoveries", &disc_id, &disc);
+                Reply::redirect(format!(
+                    "/connected.html?connection=failed&service={}&serviceName={}&attempt={}{desktop_q}",
+                    url_encode_component(&slug),
+                    url_encode_component(&name),
+                    url_encode_component(&state),
+                ))
+            }
+        };
+    }
 
     if !oauth_err.is_empty() || code.is_empty() {
         let outcome = if oauth_err == "access_denied" {
@@ -2146,6 +2842,72 @@ pub fn connected_mcp_tools(store: &Store) -> Vec<ConnectedMcpToolSpec> {
     out
 }
 
+fn ensure_composio_proxy_session(
+    store: &Store,
+    connection_filter: Option<&str>,
+) -> Result<(String, String), String> {
+    let proxy_origin = composio_proxy_origin()
+        .ok_or_else(|| "Composio proxy is not enabled in this environment.".to_string())?;
+    let proxy_apps: Vec<Value> = store
+        .all("apps")
+        .into_iter()
+        .filter(|a| text(a, "status") == "connected" && text(a, "kind") == "composio_proxy")
+        .filter(|a| connection_filter.map(|cid| text(a, "id") == cid).unwrap_or(true))
+        .collect();
+    if proxy_apps.is_empty() {
+        return Err("No Composio apps are connected.".to_string());
+    }
+    let identity = load_or_create_proxy_identity(store)?;
+    let mut toolkits = Vec::new();
+    let mut connected_accounts = serde_json::Map::new();
+    for app in &proxy_apps {
+        let slug = text(app, "slug");
+        let cid = text(app, "connectionId");
+        if !slug.is_empty() && !cid.is_empty() {
+            if !toolkits.contains(&slug) {
+                toolkits.push(slug.clone());
+            }
+            connected_accounts.entry(slug).or_insert_with(|| json!(cid));
+        }
+    }
+    let cache_key = format!(
+        "{}|{}|{}",
+        proxy_origin,
+        identity.user_id,
+        Value::Object(connected_accounts.clone())
+    );
+    if let Ok(guard) = proxy_sessions().lock()
+        && let Some((sid, created)) = guard.get(&cache_key)
+        && created.elapsed() < Duration::from_secs(10 * 60)
+    {
+        return Ok((proxy_origin, sid.clone()));
+    }
+
+    let created = proxy_signed_request(
+        store,
+        &proxy_origin,
+        "POST",
+        "/v2/api/v3.1/tool_router/session",
+        Some(&json!({
+            "user_id": identity.user_id,
+            "toolkits": toolkits,
+            "connected_accounts": connected_accounts,
+            "manage_connections": false,
+        })),
+    )?;
+    let sid = created
+        .get("session_id")
+        .or_else(|| created.get("sessionId"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "Composio did not return a tool session ID.".to_string())?
+        .to_string();
+    if let Ok(mut guard) = proxy_sessions().lock() {
+        guard.insert(cache_key, (sid.clone(), Instant::now()));
+    }
+    Ok((proxy_origin, sid))
+}
+
 pub fn call_connected_mcp_tool(
     store: &Store,
     connection_id: &str,
@@ -2154,7 +2916,24 @@ pub fn call_connected_mcp_tool(
 ) -> Result<Value, String> {
     let conn = store
         .get("apps", connection_id)
-        .ok_or_else(|| "Connected MCP account not found.".to_string())?;
+        .ok_or_else(|| "Connected app account not found.".to_string())?;
+    if text(&conn, "kind") == "composio_proxy" {
+        let account_id = text(&conn, "connectionId");
+        let (proxy_origin, sid) = ensure_composio_proxy_session(store, Some(connection_id))?;
+        let path = format!("/v2/api/v3.1/tool_router/session/{sid}/execute");
+        let res = proxy_signed_request(
+            store,
+            &proxy_origin,
+            "POST",
+            &path,
+            Some(&json!({
+                "tool_slug": tool_name,
+                "arguments": input,
+                "account": account_id,
+            })),
+        )?;
+        return Ok(res);
+    }
     let endpoint = conn
         .pointer("/accessPaths/0/endpoint")
         .and_then(Value::as_str)
@@ -2249,10 +3028,95 @@ pub fn search_connected_tools(store: &Store, query: &str, connection_filter: Opt
         }
     }
 
-    json!({
+    let mut search_error: Option<String> = None;
+    let has_proxy_apps = store
+        .all("apps")
+        .iter()
+        .any(|a| text(a, "status") == "connected" && text(a, "kind") == "composio_proxy");
+    if matched.len() < 25 && !query.trim().is_empty() && has_proxy_apps {
+        match ensure_composio_proxy_session(store, connection_filter) {
+            Err(err) => search_error = Some(err),
+            Ok((proxy_origin, sid)) => {
+                let toolkits: Vec<String> = store
+                    .all("apps")
+                    .into_iter()
+                    .filter(|a| text(a, "status") == "connected" && text(a, "kind") == "composio_proxy")
+                    .filter(|a| connection_filter.map(|cid| text(a, "id") == cid).unwrap_or(true))
+                    .map(|a| text(&a, "slug"))
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if !toolkits.is_empty() {
+                    let search_result = proxy_signed_request(
+                        store,
+                        &proxy_origin,
+                        "POST",
+                        &format!("/v2/api/v3.1/tool_router/session/{sid}/search"),
+                        Some(&json!({
+                            "query": query,
+                            "toolkits": toolkits,
+                        })),
+                    );
+                    match search_result {
+                        Err(err) => search_error = Some(err),
+                        Ok(search_res) => {
+                            let schemas = search_res
+                                .get("tool_schemas")
+                                .or_else(|| search_res.get("toolSchemas"))
+                                .and_then(Value::as_object);
+                            if let Some(schemas) = schemas {
+                                for (slug, tool) in schemas {
+                                    let tk = tool
+                                        .get("toolkit")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_ascii_lowercase();
+                                    let cid = store
+                                        .all("apps")
+                                        .into_iter()
+                                        .find(|a| {
+                                            text(a, "kind") == "composio_proxy"
+                                                && text(a, "slug") == tk
+                                                && connection_filter
+                                                    .map(|cid| text(a, "id") == cid)
+                                                    .unwrap_or(true)
+                                        })
+                                        .map(|a| text(&a, "id"))
+                                        .unwrap_or_default();
+                                    if cid.is_empty() {
+                                        continue;
+                                    }
+                                    matched.push(json!({
+                                        "connectionId": cid,
+                                        "service": tk,
+                                        "appName": tk,
+                                        "tool": slug,
+                                        "description": tool.get("description").and_then(Value::as_str).unwrap_or_default(),
+                                        "inputSchema": tool.get("input_schema").or_else(|| tool.get("inputSchema")).cloned().unwrap_or_else(|| json!({})),
+                                    }));
+                                    if matched.len() >= 25 {
+                                        break;
+                                    }
+                                }
+                            } else {
+                                search_error = Some(
+                                    "The app tool search returned an unexpected response.".to_string(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut result = json!({
         "accounts": accounts,
         "tools": matched,
-    })
+    });
+    if let Some(err) = search_error {
+        result["error"] = json!(err);
+    }
+    result
 }
 
 fn strip_html_to_text(raw: &str) -> String {
@@ -2432,6 +3296,37 @@ pub fn connected_apps_summary(store: &Store) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn proxy_origin_rejects_cleartext_private_and_credentialed_addresses() {
+        assert!(validated_proxy_origin("http://169.254.169.254").is_err());
+        assert!(validated_proxy_origin("http://10.0.0.4:8080").is_err());
+        assert!(validated_proxy_origin("https://user:pass@composio.n8n.cloud").is_err());
+        assert!(validated_proxy_origin("not a url").is_err());
+        assert_eq!(
+            validated_proxy_origin("http://127.0.0.1:8787").unwrap(),
+            "http://127.0.0.1:8787"
+        );
+    }
+
+    #[test]
+    fn catalog_pagination_reports_remote_failures_instead_of_empty_results() {
+        let missing_items = fetch_composio_pages(|_| Ok(json!({ "unexpected": true })));
+        assert!(missing_items.is_err());
+        assert!(missing_items.unwrap_err().contains("toolkit list"));
+
+        let page = std::cell::Cell::new(0_u32);
+        let never_ends = fetch_composio_pages(|_| {
+            let next = page.get() + 1;
+            page.set(next);
+            Ok(json!({
+                "items": [],
+                "next_cursor": format!("cursor-{next}")
+            }))
+        });
+        assert!(never_ends.is_err());
+        assert!(never_ends.unwrap_err().contains("every page"));
+    }
+
     use super::*;
     use crate::runtime::RuntimeManager;
     use crate::server::Live;
@@ -2463,8 +3358,14 @@ mod tests {
         handle(&ctx).expect("handled")
     }
 
+    static PROXY_TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
     #[test]
     fn apps_bundled_catalog_ssrf_and_live_mcp_verification_work() {
+        let _env_guard = PROXY_TEST_ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        if let Ok(mut g) = composio_cache().lock() {
+            *g = None;
+        }
         let store = Arc::new(Store::open_in_memory().expect("store"));
         let live = Arc::new(Live::default());
         let runtime = RuntimeManager::new(Arc::clone(&live));
@@ -2576,5 +3477,220 @@ mod tests {
         assert!(out.to_string().contains("[redacted]"));
 
         drop(srv_handle);
+    }
+
+    #[test]
+    fn composio_proxy_catalog_connect_and_tool_call_work() {
+        let _env_guard = PROXY_TEST_ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        struct EnvReset(Option<String>);
+        impl Drop for EnvReset {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.0 {
+                        Some(v) => std::env::set_var("NOD_COMPOSIO_PROXY_URL", v),
+                        None => std::env::remove_var("NOD_COMPOSIO_PROXY_URL"),
+                    }
+                }
+            }
+        }
+        let _reset = EnvReset(std::env::var("NOD_COMPOSIO_PROXY_URL").ok());
+
+        if let Ok(mut g) = composio_cache().lock() {
+            *g = None;
+        }
+        if let Ok(mut g) = proxy_enrolled().lock() {
+            g.clear();
+        }
+        if let Ok(mut g) = proxy_sessions().lock() {
+            g.clear();
+        }
+        if let Ok(mut g) = proxy_attempts().lock() {
+            g.clear();
+        }
+
+        let store = Arc::new(Store::open_in_memory().expect("store"));
+        let live = Arc::new(Live::default());
+        let runtime = RuntimeManager::new(Arc::clone(&live));
+        let identity = load_or_create_proxy_identity(store.as_ref()).expect("identity");
+        let expected_pk = identity.public_key;
+        let expected_uid = identity.user_id;
+
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("mock proxy");
+        let port = server.server_addr().to_ip().unwrap().port();
+        let proxy_url = format!("http://127.0.0.1:{port}");
+        unsafe {
+            std::env::set_var("NOD_COMPOSIO_PROXY_URL", &proxy_url);
+        }
+
+        let proxy_url_srv = proxy_url.clone();
+        let srv_handle = thread::spawn(move || {
+            for mut req in server.incoming_requests().take(7) {
+                let mut body_buf = String::new();
+                let _ = req.as_reader().read_to_string(&mut body_buf);
+                let parsed: Value = serde_json::from_str(&body_buf).unwrap_or(Value::Null);
+                let pk_hdr = req
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("x-nod-public-key"))
+                    .map(|h| h.value.as_str().to_string())
+                    .unwrap_or_default();
+                let sig_hdr = req
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("x-nod-signature"))
+                    .map(|h| h.value.as_str().to_string())
+                    .unwrap_or_default();
+                assert_eq!(pk_hdr, expected_pk);
+                assert!(!sig_hdr.is_empty());
+
+                let path = req.url().to_string();
+                let resp_val = if path == "/v2/access/enroll" {
+                    json!({ "state": "enabled", "userId": expected_uid })
+                } else if path.starts_with("/v2/api/v3.1/toolkits") {
+                    json!({
+                        "items": [{
+                            "slug": "gmail",
+                            "name": "Gmail",
+                            "meta": {
+                                "description": "Read and send email.",
+                                "categories": [{ "name": "Communication" }],
+                                "logo": "https://logos.composio.dev/api/gmail"
+                            },
+                            "composio_managed_auth_schemes": ["OAUTH2"]
+                        }],
+                        "next_cursor": null
+                    })
+                } else if path == "/v2/connect/start" {
+                    assert_eq!(parsed["toolkit"].as_str(), Some("gmail"));
+                    json!({
+                        "transactionId": parsed["transactionId"],
+                        "redirectUrl": format!("{proxy_url_srv}/v2/connect/pair?ticket=tkt-1")
+                    })
+                } else if path == "/v2/connect/complete" {
+                    assert_eq!(parsed["completionToken"].as_str(), Some("tok-1"));
+                    json!({
+                        "toolkit": "gmail",
+                        "status": "ACTIVE",
+                        "connectedAccountId": "ca-gmail-1"
+                    })
+                } else if path == "/v2/api/v3.1/tool_router/session" {
+                    json!({ "session_id": "sess-1" })
+                } else if path == "/v2/api/v3.1/tool_router/session/sess-1/search" {
+                    json!({
+                        "tool_schemas": {
+                            "GMAIL_FETCH_EMAILS": {
+                                "toolkit": "gmail",
+                                "description": "Fetch emails",
+                                "input_schema": { "type": "object" }
+                            }
+                        }
+                    })
+                } else if path == "/v2/api/v3.1/tool_router/session/sess-1/execute" {
+                    assert_eq!(parsed["tool_slug"].as_str(), Some("GMAIL_FETCH_EMAILS"));
+                    assert_eq!(parsed["account"].as_str(), Some("ca-gmail-1"));
+                    json!({ "data": { "messages": ["hello"] }, "successful": true })
+                } else {
+                    json!({})
+                };
+                let hdr = tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap();
+                let resp = tiny_http::Response::from_string(resp_val.to_string()).with_header(hdr);
+                let _ = req.respond(resp);
+            }
+        });
+
+        let cat = call(&store, &live, &runtime, "GET", "/api/apps/catalog", Value::Null);
+        assert_eq!(cat.status, 200);
+        let items = cat.body.as_array().unwrap();
+        assert!(items.iter().any(|i| i["slug"].as_str() == Some("gmail")));
+        assert!(items.iter().any(|i| i["slug"].as_str() == Some("linear")));
+
+        let started = call(
+            &store,
+            &live,
+            &runtime,
+            "POST",
+            "/api/apps/gmail/connect",
+            json!({ "returnTo": "apps" }),
+        );
+        assert_eq!(started.status, 200);
+        let connect_url = started.body["url"].as_str().unwrap();
+        let attempt = started.body["attempt"].as_str().unwrap().to_string();
+        let cap = connect_url.rsplit('/').next().unwrap().to_string();
+        let cap_path = format!("/api/apps/connect/{cap}");
+
+        let bridge_html = call(&store, &live, &runtime, "GET", &cap_path, Value::Null);
+        assert_eq!(bridge_html.status, 200);
+
+        let bridge_key = proxy_attempts()
+            .lock()
+            .unwrap()
+            .get(&cap)
+            .unwrap()
+            .bridge_key
+            .clone();
+        let mut start_query = HashMap::new();
+        start_query.insert("__x_nod_bridge".to_string(), bridge_key);
+        start_query.insert("__req_origin".to_string(), live.origin().to_string());
+        let b64_43 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let start_ctx = Ctx {
+            method: "POST",
+            path: &cap_path,
+            query: &start_query,
+            body: json!({
+                "browserKey": { "kty": "EC", "crv": "P-256", "x": b64_43, "y": b64_43 }
+            }),
+            body_bytes: &[],
+            content_type: "application/json",
+            store: &store,
+            live: &live,
+            runtime: &runtime,
+            owner: "owner",
+        };
+        let bridge_post = handle(&start_ctx).expect("bridge post");
+        assert_eq!(bridge_post.status, 200);
+        assert!(bridge_post.body["url"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("{proxy_url}/v2/connect/pair?ticket=")));
+
+        let mut cb_query = HashMap::new();
+        cb_query.insert("state".to_string(), attempt);
+        cb_query.insert("completion_token".to_string(), "tok-1".to_string());
+        let cb_ctx = Ctx {
+            method: "GET",
+            path: "/api/apps/callback",
+            query: &cb_query,
+            body: Value::Null,
+            body_bytes: &[],
+            content_type: "application/json",
+            store: &store,
+            live: &live,
+            runtime: &runtime,
+            owner: "owner",
+        };
+        let cb_reply = handle(&cb_ctx).expect("callback");
+        assert_eq!(cb_reply.status, 302);
+
+        let searched = search_connected_tools(store.as_ref(), "emails", None);
+        let tools = searched["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|t| t["tool"].as_str() == Some("GMAIL_FETCH_EMAILS")));
+        let conn_id = tools
+            .iter()
+            .find(|t| t["tool"].as_str() == Some("GMAIL_FETCH_EMAILS"))
+            .unwrap()["connectionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let executed = call_connected_mcp_tool(
+            store.as_ref(),
+            &conn_id,
+            "GMAIL_FETCH_EMAILS",
+            json!({ "limit": 5 }),
+        )
+        .expect("execute proxy tool");
+        assert_eq!(executed["successful"], json!(true));
+
+        let _ = srv_handle.join();
     }
 }

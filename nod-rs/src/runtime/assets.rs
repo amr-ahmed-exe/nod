@@ -597,7 +597,27 @@ pub fn recover_manifest_from_wsl(
     Ok(manifest)
 }
 
-/// Fetches the signed Windows runtime descriptor and release URL from official `n8n-io/nod` releases for standalone installs.
+fn select_release_asset<'a>(assets: &'a [Value], prefix: &str, exact: bool) -> Option<&'a Value> {
+    assets
+        .iter()
+        .filter(|entry| {
+            let matches = entry.get("name").and_then(Value::as_str).is_some_and(|name| {
+                if exact {
+                    name == prefix
+                } else {
+                    name.starts_with(prefix) && name.ends_with(".json")
+                }
+            });
+            matches && entry.get("state").and_then(Value::as_str) != Some("draft")
+        })
+        .max_by_key(|entry| {
+            entry
+                .get("created_at")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        })
+}
+
 pub fn fetch_latest_windows_runtime_manifest(
     paths: &RuntimePaths,
     _redactor: &Redactor,
@@ -606,90 +626,115 @@ pub fn fetch_latest_windows_runtime_manifest(
         .ok()
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| "amr-ahmed-exe/nod".to_string());
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(20))
+        .timeout_read(Duration::from_secs(30))
+        .user_agent("Nod/0.1 native")
+        .build();
+    let target_root = paths.import_assets_root();
+
     let api_url = std::env::var("NOD_DESKTOP_RELEASE_API")
         .ok()
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| format!("https://api.github.com/repos/{default_repo}/releases/latest"));
     validate_url(&api_url)?;
 
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(20))
-        .timeout_read(Duration::from_secs(30))
-        .user_agent("Nod/0.1 native")
-        .build();
-    let release_resp = agent
+    if let Ok(release_resp) = agent
         .get(&api_url)
         .set("Accept", "application/vnd.github+json")
         .call()
-        .map_err(|err| {
-            RuntimeError::archive_required(format!(
-                "The Windows runtime manifest could not be found locally, and checking the release feed failed: {err}"
-            ))
-        })?;
-    let release_json: Value = serde_json::from_reader(release_resp.into_reader()).map_err(|err| {
-        RuntimeError::archive_required(format!("Invalid release feed metadata: {err}"))
-    })?;
-    let tag = release_json
-        .get("tag_name")
-        .and_then(Value::as_str)
-        .filter(|t| !t.trim().is_empty())
-        .ok_or_else(|| RuntimeError::archive_required("Release tag missing from release feed."))?;
-    let assets_arr = release_json
-        .get("assets")
-        .and_then(Value::as_array)
-        .ok_or_else(|| RuntimeError::archive_required("Release assets missing from release feed."))?;
+        && let Ok(release_json) = serde_json::from_reader::<_, Value>(release_resp.into_reader())
+        && let Some(tag) = release_json
+            .get("tag_name")
+            .and_then(Value::as_str)
+            .filter(|t| !t.trim().is_empty())
+        && let Some(assets_arr) = release_json.get("assets").and_then(Value::as_array)
+    {
+        let find_asset = |prefix: &str, exact: bool| -> Option<(String, u64, Option<String>)> {
+            select_release_asset(assets_arr, prefix, exact).and_then(|entry| {
+                let url = entry.get("browser_download_url").and_then(Value::as_str)?.to_string();
+                let size = entry.get("size").and_then(Value::as_u64)?;
+                let sha = entry
+                    .get("digest")
+                    .and_then(Value::as_str)
+                    .and_then(|d| d.strip_prefix("sha256:"))
+                    .map(str::to_string);
+                Some((url, size, sha))
+            })
+        };
 
-    let find_asset = |prefix: &str, exact: bool| -> Option<(String, u64, Option<String>)> {
-        assets_arr.iter().find_map(|entry| {
-            let name = entry.get("name").and_then(Value::as_str)?;
-            let matched = if exact { name == prefix } else { name.starts_with(prefix) && name.ends_with(".json") };
-            if !matched || entry.get("state").and_then(Value::as_str) == Some("draft") {
-                return None;
+        if let Some((guest_url, guest_size, guest_digest)) =
+            find_asset("nod-Runtime-win32-x64.tar.gz", true)
+            && let Some((runtime_meta_url, runtime_meta_size, _)) =
+                find_asset("runtime-win32-x64-", false)
+                    .or_else(|| find_asset("runtime-win32-x64.json", true))
+        {
+            validate_url(&guest_url)?;
+            validate_url(&runtime_meta_url)?;
+            if runtime_meta_size > 2 * 1024 * 1024 {
+                return Err(RuntimeError::archive_required(
+                    "The Windows runtime descriptor is too large.",
+                ));
             }
-            let url = entry.get("browser_download_url").and_then(Value::as_str)?.to_string();
-            let size = entry.get("size").and_then(Value::as_u64)?;
-            let sha = entry
-                .get("digest")
-                .and_then(Value::as_str)
-                .and_then(|d| d.strip_prefix("sha256:"))
-                .map(str::to_string);
-            Some((url, size, sha))
-        })
-    };
-
-    let (guest_url, guest_size, guest_digest) = find_asset("nod-Runtime-win32-x64.tar.gz", true)
-        .ok_or_else(|| RuntimeError::archive_required("The Windows runtime archive was not found in the latest release."))?;
-    validate_url(&guest_url)?;
-    let (runtime_meta_url, runtime_meta_size, _) = find_asset("runtime-win32-x64-", false)
-        .ok_or_else(|| RuntimeError::archive_required("The Windows runtime descriptor was not found in the latest release."))?;
-    validate_url(&runtime_meta_url)?;
-    if runtime_meta_size > 2 * 1024 * 1024 {
-        return Err(RuntimeError::archive_required("The Windows runtime descriptor is too large."));
+            let meta_resp = agent.get(&runtime_meta_url).call().map_err(|err| {
+                RuntimeError::archive_required(format!(
+                    "Could not download Windows runtime descriptor: {err}"
+                ))
+            })?;
+            let mut raw: Value = serde_json::from_reader(meta_resp.into_reader()).map_err(|err| {
+                RuntimeError::archive_required(format!("Invalid Windows runtime descriptor: {err}"))
+            })?;
+            if let Some(obj) = raw.as_object_mut() {
+                obj.insert("transportMode".to_string(), Value::String("wsl".to_string()));
+                obj.insert("releaseTag".to_string(), Value::String(tag.to_string()));
+                if let Some(guest_obj) = obj.get_mut("guest").and_then(Value::as_object_mut) {
+                    if let Some(expected_sha) = &guest_digest
+                        && guest_obj.get("sha256").and_then(Value::as_str)
+                            != Some(expected_sha.as_str())
+                    {
+                        return Err(RuntimeError::archive_required(
+                            "The release asset checksum does not match the runtime manifest.",
+                        ));
+                    }
+                    if guest_obj.get("bytes").and_then(Value::as_u64) != Some(guest_size) {
+                        return Err(RuntimeError::archive_required(
+                            "The release asset size does not match the runtime manifest.",
+                        ));
+                    }
+                    guest_obj.insert("url".to_string(), Value::String(guest_url));
+                }
+            }
+            let manifest = parse_guest_manifest(&raw, &target_root, None)?;
+            let _ = fs::create_dir_all(&target_root);
+            let persisted = serde_json::to_vec_pretty(&raw).map_err(|err| {
+                RuntimeError::archive_required(format!("Could not store runtime manifest: {err}"))
+            })?;
+            storage::atomic_write(&target_root.join("manifest.json"), &persisted).map_err(|err| {
+                RuntimeError::archive_required(format!("Could not write runtime manifest: {err}"))
+            })?;
+            return Ok(manifest);
+        }
     }
 
-    let meta_resp = agent.get(&runtime_meta_url).call().map_err(|err| {
-        RuntimeError::archive_required(format!("Could not download Windows runtime descriptor: {err}"))
+    let direct_meta_url =
+        format!("https://github.com/{default_repo}/releases/latest/download/runtime-win32-x64.json");
+    let direct_guest_url =
+        format!("https://github.com/{default_repo}/releases/latest/download/nod-Runtime-win32-x64.tar.gz");
+    validate_url(&direct_meta_url)?;
+    let meta_resp = agent.get(&direct_meta_url).call().map_err(|err| {
+        RuntimeError::archive_required(format!(
+            "Could not fetch the Alpine WSL2 runtime from GitHub Releases: {err}"
+        ))
     })?;
     let mut raw: Value = serde_json::from_reader(meta_resp.into_reader()).map_err(|err| {
         RuntimeError::archive_required(format!("Invalid Windows runtime descriptor: {err}"))
     })?;
-    let target_root = paths.import_assets_root();
     if let Some(obj) = raw.as_object_mut() {
         obj.insert("transportMode".to_string(), Value::String("wsl".to_string()));
-        obj.insert("releaseTag".to_string(), Value::String(tag.to_string()));
-        if let Some(guest_obj) = obj.get_mut("guest").and_then(Value::as_object_mut) {
-            if let Some(expected_sha) = &guest_digest
-                && guest_obj.get("sha256").and_then(Value::as_str) != Some(expected_sha.as_str()) {
-                    return Err(RuntimeError::archive_required(
-                        "The release asset checksum does not match the runtime manifest.",
-                    ));
-                }
-            if guest_obj.get("bytes").and_then(Value::as_u64) != Some(guest_size) {
-                return Err(RuntimeError::archive_required(
-                    "The release asset size does not match the runtime manifest.",
-                ));
-            }
-            guest_obj.insert("url".to_string(), Value::String(guest_url));
+        if let Some(guest_obj) = obj.get_mut("guest").and_then(Value::as_object_mut)
+            && guest_obj.get("url").and_then(Value::as_str).is_none()
+        {
+            guest_obj.insert("url".to_string(), Value::String(direct_guest_url));
         }
     }
     let manifest = parse_guest_manifest(&raw, &target_root, None)?;
@@ -1416,6 +1461,43 @@ fn measure_gzip_expanded_bytes(path: &Path) -> Result<u64, RuntimeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_asset_selection_prefers_newest_runtime_descriptor() {
+        let assets = vec![
+            json!({
+                "name": "runtime-win32-x64-older.json",
+                "state": "uploaded",
+                "created_at": "2026-11-25T14:10:41Z",
+                "browser_download_url": "https://example.com/older.json",
+                "size": 1310
+            }),
+            json!({
+                "name": "runtime-win32-x64-newer.json",
+                "state": "uploaded",
+                "created_at": "2026-11-25T14:16:56Z",
+                "browser_download_url": "https://example.com/newer.json",
+                "size": 1310
+            }),
+            json!({
+                "name": "runtime-win32-x64-draft.json",
+                "state": "draft",
+                "created_at": "2026-11-25T15:00:00Z",
+                "browser_download_url": "https://example.com/draft.json",
+                "size": 1310
+            }),
+        ];
+        let chosen = select_release_asset(&assets, "runtime-win32-x64-", false).unwrap();
+        assert_eq!(
+            chosen.get("browser_download_url").and_then(Value::as_str),
+            Some("https://example.com/newer.json")
+        );
+        let exact = select_release_asset(&assets, "runtime-win32-x64-older.json", true).unwrap();
+        assert_eq!(
+            exact.get("browser_download_url").and_then(Value::as_str),
+            Some("https://example.com/older.json")
+        );
+    }
     use serde_json::json;
 
     fn valid_manifest() -> Value {

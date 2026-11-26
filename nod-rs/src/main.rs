@@ -40,6 +40,9 @@ fn parse_cli_options() -> Result<CliOptions, String> {
     while let Some(arg) = args.next() {
         if arg == "--headless" {
             headless = true;
+        } else if arg == "--quit" {
+            quit_running_nod();
+            std::process::exit(0);
         } else if arg == "--version" || arg == "-V" {
             println!("nod {}", env!("CARGO_PKG_VERSION"));
             std::process::exit(0);
@@ -85,6 +88,16 @@ fn parse_cli_options() -> Result<CliOptions, String> {
         host,
         port,
     })
+}
+
+fn quit_running_nod() {
+    #[cfg(windows)]
+    {
+        let mut cmd = std::process::Command::new(runtime::windows::system32().join("taskkill.exe"));
+        cmd.args(["/IM", "nod.exe", "/T", "/F"]);
+        runtime::windows::hide_console(&mut cmd);
+        let _ = cmd.status();
+    }
 }
 
 fn run_headless(opts: &CliOptions) -> Result<(), Box<dyn std::error::Error>> {

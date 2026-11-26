@@ -1,0 +1,144 @@
+Unicode true
+!include "MUI2.nsh"
+!include "x64.nsh"
+Name "Nod"
+OutFile "${OUTPUT}"
+InstallDir "$LOCALAPPDATA\Programs\nod"
+InstallDirRegKey HKCU "Software\nod" "InstallDir"
+RequestExecutionLevel user
+SetCompressor /SOLID lzma
+ShowInstDetails hide
+AutoCloseWindow true
+!define MUI_ICON "${ICON}"
+!define MUI_UNICON "${ICON}"
+!define MUI_ABORTWARNING
+!define MUI_PAGE_CUSTOMFUNCTION_LEAVE CheckInstallDirectory
+!insertmacro MUI_PAGE_DIRECTORY
+!insertmacro MUI_PAGE_INSTFILES
+!insertmacro MUI_UNPAGE_CONFIRM
+!insertmacro MUI_UNPAGE_INSTFILES
+!insertmacro MUI_LANGUAGE "English"
+
+Function .onInit
+  ${IfNot} ${IsNativeAMD64}
+    MessageBox MB_ICONSTOP "Nod requires a 64-bit Windows computer." /SD IDOK
+    SetErrorLevel 1
+    Abort
+  ${EndIf}
+FunctionEnd
+
+Function .onInstSuccess
+  IfSilent installed
+  Exec '"$INSTDIR\nod.exe"'
+  installed:
+FunctionEnd
+
+Function CheckInstallDirectory
+  IfFileExists "$INSTDIR\.nod-installation" directory_ready
+  FindFirst $0 $1 "$INSTDIR\*"
+  directory_next:
+    StrCmp $1 "" directory_empty
+    StrCmp $1 "." directory_continue
+    StrCmp $1 ".." directory_continue
+    FindClose $0
+    MessageBox MB_ICONSTOP "Choose an empty folder for Nod. The selected folder contains other files." /SD IDOK
+    SetErrorLevel 1
+    Abort
+  directory_continue:
+    FindNext $0 $1
+    Goto directory_next
+  directory_empty:
+    FindClose $0
+  directory_ready:
+    SetErrorLevel 0
+    ClearErrors
+FunctionEnd
+
+!macro CLOSE_NOD UN
+Function ${UN}CloseNod
+  IfFileExists "$INSTDIR\nod.exe" 0 nod_closed
+  StrCpy $1 0
+  nod_check:
+    ClearErrors
+    FileOpen $0 "$INSTDIR\nod.exe" a
+    IfErrors nod_running
+    FileClose $0
+    Goto nod_closed
+  nod_running:
+    IntCmp $1 0 0 nod_wait nod_wait
+    MessageBox MB_OKCANCEL|MB_ICONINFORMATION "Nod is still running. Select OK to quit Nod and continue." /SD IDOK IDOK nod_quit
+    SetErrorLevel 1
+    Abort
+  nod_quit:
+    DetailPrint "Closing running Nod instance..."
+    Exec '"$INSTDIR\nod.exe" --quit'
+  nod_wait:
+    IntOp $1 $1 + 1
+    IntCmp $1 40 nod_stuck 0 nod_stuck
+    Sleep 250
+    Goto nod_check
+  nod_stuck:
+    MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "Nod is still running. Select its icon in the taskbar tray, choose Quit, then click Retry." /SD IDCANCEL IDRETRY nod_retry
+    SetErrorLevel 1
+    Abort
+  nod_retry:
+    StrCpy $1 1
+    Goto nod_check
+  nod_closed:
+  ClearErrors
+FunctionEnd
+!macroend
+!insertmacro CLOSE_NOD ""
+!insertmacro CLOSE_NOD "un."
+
+Section "nod"
+  Call CheckInstallDirectory
+  Call CloseNod
+  SetShellVarContext current
+  SetOutPath "$INSTDIR"
+  FileOpen $0 "$INSTDIR\.nod-installation" w
+  FileWrite $0 "nod-win32-x64"
+  FileClose $0
+  IfErrors 0 directory_marked
+    SetErrorLevel 1
+    Abort
+  directory_marked:
+  WriteUninstaller "$INSTDIR\Uninstall.exe"
+  File /r "${APP_DIR}\*"
+  IfFileExists "$EXEDIR\nod-Runtime-win32-x64.tar.gz" 0 runtime_copied
+    CreateDirectory "$INSTDIR\resources\engine\windows-runtime"
+    ClearErrors
+    CopyFiles /SILENT "$EXEDIR\nod-Runtime-win32-x64.tar.gz" "$INSTDIR\resources\engine\windows-runtime\nod-Runtime-win32-x64.tar.gz"
+    IfErrors 0 runtime_copied
+      MessageBox MB_ICONSTOP "Nod could not copy its runtime archive. Check free disk space, then run this installer again." /SD IDOK
+      SetErrorLevel 1
+      Abort
+  runtime_copied:
+  CreateDirectory "$SMPROGRAMS\Nod"
+  CreateShortcut "$SMPROGRAMS\Nod\Nod.lnk" "$INSTDIR\nod.exe"
+  CreateShortcut "$SMPROGRAMS\Nod\Uninstall.lnk" "$INSTDIR\Uninstall.exe"
+  CreateShortcut "$DESKTOP\Nod.lnk" "$INSTDIR\nod.exe"
+  WriteRegStr HKCU "Software\nod" "InstallDir" "$INSTDIR"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\nod" "DisplayName" "Nod"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\nod" "DisplayVersion" "${VERSION}"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\nod" "Publisher" "amr-ahmed-exe"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\nod" "DisplayIcon" "$INSTDIR\nod.exe"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\nod" "UninstallString" '"$INSTDIR\Uninstall.exe"'
+  WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\nod" "NoModify" 1
+  WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\nod" "NoRepair" 1
+SectionEnd
+
+Section "Uninstall"
+  Call un.CloseNod
+  SetShellVarContext current
+  Delete "$DESKTOP\Nod.lnk"
+  Delete "$SMPROGRAMS\Nod\Nod.lnk"
+  Delete "$SMPROGRAMS\Nod\Uninstall.lnk"
+  RMDir "$SMPROGRAMS\Nod"
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "Nod"
+  IfFileExists "$INSTDIR\.nod-installation" 0 files_removed
+    RMDir /r "$INSTDIR"
+  files_removed:
+  DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\nod"
+  DeleteRegKey HKCU "Software\nod"
+SectionEnd

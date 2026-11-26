@@ -29,6 +29,7 @@ type RuntimeStatus = {
   needsStorage?: boolean;
   needsRuntimeArchive?: boolean;
   needsServerConnection?: boolean;
+  restartRequired?: boolean;
 };
 
 type Status = RuntimeStatus & {
@@ -535,6 +536,18 @@ function Startup() {
       return desktop.prepare({ retry: true });
     });
 
+  const wslSetupNeeded = Boolean(failure && (failure.needsWsl || runtime?.needsWsl));
+  const restartNeeded = Boolean(failure?.restartRequired || runtime?.restartRequired);
+  const setupTitle = error
+    ? restartNeeded
+      ? 'Restart Windows to finish setup'
+      : wslSetupNeeded
+        ? 'Install WSL2 to continue'
+        : 'Nod needs another try'
+    : status.remote
+      ? 'Connecting to your server…'
+      : active.message || startupMessage(active.stage);
+
   return (
     <>
       <><DesktopTitlebar /><DesktopResizeEdges /></>
@@ -549,13 +562,7 @@ function Startup() {
             Connect to a server
           </button>
         }
-        title={
-          error
-            ? 'Nod needs another try'
-            : status.remote
-              ? 'Connecting to your server…'
-              : active.message || startupMessage(active.stage)
-        }
+        title={setupTitle}
         description={unlocking || error ? description : undefined}
         error={error}
         details={error ? failure?.details : undefined}
@@ -564,12 +571,25 @@ function Startup() {
       >
         {failure && desktop && (
           <div className="recovery-actions">
+            {wslSetupNeeded && !restartNeeded && (
+              <button
+                type="button"
+                disabled={working}
+                onClick={() => void run(() => desktop.installWsl())}
+              >
+                {working ? 'Installing WSL2…' : 'Install WSL automatically'}
+              </button>
+            )}
             <button type="button" disabled={working} onClick={() => void retry()}>
               {working
                 ? 'Trying again…'
                 : failure.needsServerConnection
                   ? 'Reconnect to server'
-                  : 'Try again'}
+                  : restartNeeded
+                    ? 'Check again'
+                    : wslSetupNeeded
+                      ? 'I already installed it'
+                      : 'Try again'}
             </button>
             {!failure.needsServerConnection && (
               <button
@@ -596,15 +616,6 @@ function Startup() {
             >
               Show startup log
             </button>
-            {(failure.needsWsl || runtime?.needsWsl) && (
-              <button
-                type="button"
-                disabled={working}
-                onClick={() => void run(() => desktop.installWsl())}
-              >
-                Install WSL
-              </button>
-            )}
             {(failure.needsStorage || runtime?.needsStorage) && (
               <button
                 type="button"

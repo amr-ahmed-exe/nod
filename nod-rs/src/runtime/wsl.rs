@@ -115,10 +115,13 @@ impl Wsl {
         if lowercase.contains("no installed distribution") {
             return Ok(combined);
         }
-        if lowercase.contains("wsl")
-            && (lowercase.contains("not installed")
-                || lowercase.contains("optional component")
-                || lowercase.contains("not enabled"))
+        if lowercase.contains("not installed")
+            || lowercase.contains("optional component")
+            || lowercase.contains("not enabled")
+            || lowercase.contains("wsl_e_wsl_optional_component_required")
+            || lowercase.contains("0x8007019e")
+            || lowercase.contains("install windows subsystem for linux")
+            || lowercase.contains("requires an update to its kernel")
         {
             return Err(RuntimeError::wsl_required());
         }
@@ -508,10 +511,22 @@ pub fn install_wsl() -> Result<(), String> {
         .output()
         .map_err(|error| format!("Windows could not open the WSL installer: {error}"))?;
     if output.status.success() {
-        Ok(())
-    } else {
-        Err("WSL installation did not finish. Restart Windows, then try again.".into())
+        return Ok(());
     }
+    let code = output
+        .status
+        .code()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let reason = if detail.is_empty() {
+        format!("exit code {code}")
+    } else {
+        format!("exit code {code}: {detail}")
+    };
+    Err(format!(
+        "Windows could not install WSL ({reason}). Approve the administrator prompt and try again. If Windows asks for a restart, restart and open Nod again."
+    ))
 }
 
 pub fn hold_command(name: &str) -> Vec<String> {

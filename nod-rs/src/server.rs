@@ -199,13 +199,21 @@ impl LocalServer {
 fn handle_request(mut request: tiny_http::Request, ctx: &ServerContext) {
     let url = request.url().to_string();
     let path = url.split('?').next().unwrap_or("/").to_string();
-    let query = url
+    let mut query = url
         .split_once('?')
         .map(|(_, q)| parse_query(q))
         .unwrap_or_default();
+    query.remove("__x_nod_bridge");
+    query.remove("__req_origin");
+    if let Some(bridge_hdr) = request_header(&request, "X-Nod-Bridge") {
+        query.insert("__x_nod_bridge".to_string(), bridge_hdr.to_string());
+    }
 
     let host_ok = ctx.allow_remote_host || host_allowed(request_header(&request, "Host"), ctx.port);
     let req_origin = request_header(&request, "Origin").map(str::to_string);
+    if let Some(origin_hdr) = req_origin.as_deref() {
+        query.insert("__req_origin".to_string(), origin_hdr.to_string());
+    }
     let origin_ok = ctx.allow_remote_host || origin_allowed(req_origin.as_deref(), ctx.port);
 
     if !host_ok || !origin_ok {
@@ -251,7 +259,18 @@ fn handle_request(mut request: tiny_http::Request, ctx: &ServerContext) {
             })
             .unwrap_or(false);
 
-    if !oauth_callback && !is_request_authorized(&request, &ctx.auth_token) {
+    let app_connect_bridge = matches!(request.method(), &Method::Get | &Method::Post)
+        && path
+            .strip_prefix("/api/apps/connect/")
+            .map(|cap| {
+                cap.len() == 43
+                    && cap
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            })
+            .unwrap_or(false);
+
+    if !oauth_callback && !app_connect_bridge && !is_request_authorized(&request, &ctx.auth_token) {
         send_json_error(
             request,
             401,
@@ -412,6 +431,9 @@ fn send_reply(request: tiny_http::Request, reply: Reply, cors_origin: Option<&st
     }
     push_header(&mut headers, "Content-Type", &content_type);
     push_header(&mut headers, "Cache-Control", "no-store");
+    for (name, val) in &reply.extra_headers {
+        push_header(&mut headers, name, val);
+    }
     let mut response = Response::new(
         StatusCode(reply.status),
         headers,

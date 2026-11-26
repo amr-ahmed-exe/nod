@@ -42,6 +42,7 @@ pub struct Reply {
     pub body: Value,
     pub raw: Option<(Vec<u8>, String)>,
     pub location: Option<String>,
+    pub extra_headers: Vec<(String, String)>,
 }
 
 impl Reply {
@@ -51,6 +52,7 @@ impl Reply {
             body,
             raw: None,
             location: None,
+            extra_headers: Vec::new(),
         }
     }
 
@@ -68,6 +70,7 @@ impl Reply {
             body: Value::Null,
             raw: Some((body.into_bytes(), content_type.to_string())),
             location: None,
+            extra_headers: Vec::new(),
         }
     }
 
@@ -77,6 +80,7 @@ impl Reply {
             body: Value::Null,
             raw: Some((body, content_type)),
             location: None,
+            extra_headers: Vec::new(),
         }
     }
 
@@ -86,7 +90,13 @@ impl Reply {
             body: Value::Null,
             raw: Some((Vec::new(), "text/html; charset=utf-8".to_string())),
             location: Some(location.into()),
+            extra_headers: Vec::new(),
         }
+    }
+
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.extra_headers.push((name.into(), value.into()));
+        self
     }
 }
 

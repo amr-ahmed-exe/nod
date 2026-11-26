@@ -69,18 +69,36 @@ jobs:
         with:
           workspaces: nod-rs
 
-      - name: Verify & build Windows release binary
+      - name: Verify & build Windows release binary & NSIS installer
         shell: bash
         run: |
           cargo clippy --manifest-path nod-rs/Cargo.toml --all-targets -- -D clippy::all -D warnings
           cargo test --manifest-path nod-rs/Cargo.toml
           cargo build --manifest-path nod-rs/Cargo.toml --release
-          mkdir -p out/pkg
+          mkdir -p out/pkg out/installer-app
           cp nod-rs/target/release/nod.exe out/nod-windows-x86_64.exe
           cp nod-rs/target/release/nod.exe out/pkg/nod.exe
+          cp nod-rs/target/release/nod.exe out/installer-app/nod.exe
           cp README.md LICENSE NOTICE out/pkg/
+          cp README.md LICENSE NOTICE out/installer-app/
           (cd out/pkg && 7z a -tzip ../nod-windows-x86_64.zip nod.exe README.md LICENSE NOTICE)
-          rm -rf out/pkg
+          NSIS_EXE="/c/Program Files (x86)/NSIS/makensis.exe"
+          if [ ! -f "$NSIS_EXE" ]; then
+            choco install nsis -y
+          fi
+          VERSION_RAW="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          VERSION_CLEAN="${VERSION_RAW#nod-v}"
+          VERSION_CLEAN="${VERSION_CLEAN#v}"
+          if [[ ! "$VERSION_CLEAN" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            VERSION_CLEAN="0.1.0"
+          fi
+          MSYS2_ARG_CONV_EXCL="*" "$NSIS_EXE" \
+            "/DAPP_DIR=$(cygpath -w "$(pwd)/out/installer-app")" \
+            "/DOUTPUT=$(cygpath -w "$(pwd)/out/nod-Setup-win-x64.exe")" \
+            "/DVERSION=$VERSION_CLEAN" \
+            "/DICON=$(cygpath -w "$(pwd)/desktop/assets/nod.ico")" \
+            desktop/scripts/windows-installer.nsi
+          rm -rf out/pkg out/installer-app
 
       - uses: actions/upload-artifact@v4
         with:
@@ -117,8 +135,9 @@ jobs:
         with:
           workspaces: nod-rs
 
-      - name: Build desktop & headless Linux release binaries
+      - name: Build desktop, deb installer & headless Linux release binaries
         run: |
+          cargo clippy --manifest-path nod-rs/Cargo.toml --all-targets -- -D clippy::all -D warnings
           cargo test --manifest-path nod-rs/Cargo.toml
           cargo build --manifest-path nod-rs/Cargo.toml --release
           mkdir -p out/desktop-pkg out/headless-pkg
@@ -127,12 +146,44 @@ jobs:
           cp README.md LICENSE NOTICE out/desktop-pkg/
           tar -czf out/nod-linux-x86_64.tar.gz -C out/desktop-pkg nod README.md LICENSE NOTICE
 
+          VERSION_RAW="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          VERSION_CLEAN="${VERSION_RAW#nod-v}"
+          VERSION_CLEAN="${VERSION_CLEAN#v}"
+          if [[ ! "$VERSION_CLEAN" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            VERSION_CLEAN="0.1.0"
+          fi
+          mkdir -p out/deb/DEBIAN out/deb/usr/bin out/deb/usr/share/applications out/deb/usr/share/icons/hicolor/256x256/apps
+          cp nod-rs/target/release/nod out/deb/usr/bin/nod
+          chmod 0755 out/deb/usr/bin/nod
+          cp public/nod-logo.png out/deb/usr/share/icons/hicolor/256x256/apps/nod.png
+          cat << 'DESKTOP_EOF' > out/deb/usr/share/applications/nod.desktop
+          [Desktop Entry]
+          Name=Nod
+          Comment=Personal AI workspace assistant
+          Exec=/usr/bin/nod
+          Icon=nod
+          Terminal=false
+          Type=Application
+          Categories=Utility;Office;Development;
+          DESKTOP_EOF
+          cat << DEB_EOF > out/deb/DEBIAN/control
+          Package: nod
+          Version: $VERSION_CLEAN
+          Section: utils
+          Priority: optional
+          Architecture: amd64
+          Maintainer: amr-ahmed-exe
+          Depends: libwebkit2gtk-4.1-0, libgtk-3-0
+          Description: Native Rust desktop assistant with Alpine WSL2/container runtime
+          DEB_EOF
+          dpkg-deb --build --root-owner-group out/deb out/nod-linux-x86_64.deb
+
           cargo build --manifest-path nod-rs/Cargo.toml --release --no-default-features
           cp nod-rs/target/release/nod out/nod-linux-x86_64-headless
           cp nod-rs/target/release/nod out/headless-pkg/nod
           cp README.md LICENSE NOTICE out/headless-pkg/
           tar -czf out/nod-linux-x86_64-headless.tar.gz -C out/headless-pkg nod README.md LICENSE NOTICE
-          rm -rf out/desktop-pkg out/headless-pkg
+          rm -rf out/desktop-pkg out/headless-pkg out/deb
 
       - uses: actions/upload-artifact@v4
         with:
@@ -270,7 +321,9 @@ jobs:
           };
           const fingerprint = createHash('sha256').update(JSON.stringify(manifest)).digest('hex').slice(0, 12);
           manifest.fingerprint = fingerprint;
-          await writeFile(join(outDir, `runtime-win32-x64-${fingerprint}.json`), JSON.stringify(manifest, null, 2) + '\n');
+          const descriptorJson = JSON.stringify(manifest, null, 2) + '\n';
+          await writeFile(join(outDir, `runtime-win32-x64-${fingerprint}.json`), descriptorJson);
+          await writeFile(join(outDir, 'runtime-win32-x64.json'), descriptorJson);
           await rm(ctxDir, { recursive: true, force: true });
           EOF
 
@@ -307,6 +360,15 @@ jobs:
           sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
+      - name: Remove superseded runtime descriptors
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          gh release view "$tag" --json assets --jq '.assets[].name' 2>/dev/null \
+            | grep -E '^runtime-win32-x64(-.*)?\.json$' \
+            | while read -r name; do gh release delete-asset "$tag" "$name" -y; done || true
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -317,7 +379,9 @@ jobs:
             Native Rust builds of Nod (`amr-ahmed-exe/nod`) with Alpine Linux WSL2 guest runtime, System Tray background mode, automatic SHA-256 verified updates, and low-RAM container tuning.
 
             ### Included Assets
-            - `nod-windows-x86_64.exe` / `nod-windows-x86_64.zip` — Windows native desktop app (also used by automatic updates)
+            - `nod-Setup-win-x64.exe` — Windows NSIS installer (Start Menu, Desktop shortcut, uninstaller)
+            - `nod-windows-x86_64.exe` / `nod-windows-x86_64.zip` — Windows standalone desktop app (also used by automatic updates)
+            - `nod-linux-x86_64.deb` — Debian/Ubuntu `.deb` desktop package
             - `nod-linux-x86_64` / `nod-linux-x86_64.tar.gz` — Linux desktop binary
             - `nod-linux-x86_64-headless` / `nod-linux-x86_64-headless.tar.gz` — Linux `--headless` server binary (zero GUI deps)
             - `nod-Runtime-win32-x64.tar.gz` + `runtime-win32-x64-*.json` — Alpine 3.21 WSL2 container runtime
